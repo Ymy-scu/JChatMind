@@ -75,17 +75,16 @@ public class MarkdownParserServiceImpl implements MarkdownParserService {
                     continue;
                 }
                 
-                // 收集当前标题到下一个标题（任何级别）之间的所有内容
+                int headingLevel = heading.getLevel();
+                
                 StringBuilder contentBuilder = new StringBuilder();
                 for (int j = i + 1; j < topLevelNodes.size(); j++) {
                     Node nextNode = topLevelNodes.get(j);
                     
-                    // 如果遇到任何标题，停止收集
                     if (nextNode instanceof Heading) {
                         break;
                     }
                     
-                    // 提取节点内容
                     String content = extractNodeContent(nextNode);
                     if (content != null && !content.trim().isEmpty()) {
                         if (contentBuilder.length() > 0) {
@@ -96,7 +95,7 @@ public class MarkdownParserServiceImpl implements MarkdownParserService {
                 }
                 
                 String content = contentBuilder.toString().trim();
-                sections.add(new MarkdownSection(title, content));
+                sections.add(new MarkdownSection(title, content, headingLevel));
             }
         }
     }

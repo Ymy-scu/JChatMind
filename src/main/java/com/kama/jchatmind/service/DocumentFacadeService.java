@@ -18,4 +18,6 @@ public interface DocumentFacadeService {
     void deleteDocument(String documentId);
 
     void updateDocument(String documentId, UpdateDocumentRequest request);
+
+    void parseDocument(String documentId);
 }

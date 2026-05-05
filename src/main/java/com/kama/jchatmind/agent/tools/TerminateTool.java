@@ -12,7 +12,7 @@ public class TerminateTool implements Tool {
 
     @Override
     public String getDescription() {
-        return "跳出 Agent Loop 的工具";
+        return "当你认为已经完整回答了用户的问题时调用";
     }
 
     @Override

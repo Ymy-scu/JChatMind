@@ -34,7 +34,7 @@
         VALUES (CAST(#{kbId} AS uuid),
                 CAST(#{docId} AS uuid),
                 #{content},
-                #{metadata},
+                #{metadata}::jsonb,
                 #{embedding}::vector,
                 #{createdAt},
                 #{updatedAt})
@@ -72,7 +72,7 @@
                 content = #{content},
             </if>
             <if test="metadata != null">
-                metadata = #{metadata},
+                metadata = #{metadata}::jsonb,
             </if>
             <if test="embedding != null">
                 embedding = #{embedding}::vector,
@@ -98,4 +98,23 @@
         LIMIT #{limit}
         ]]>
     </select>
+
+    <select id="selectByDocId" resultMap="BaseResultMap">
+        SELECT id,
+               kb_id,
+               doc_id,
+               content,
+               metadata,
+               embedding,
+               created_at,
+               updated_at
+        FROM chunk_bge_m3
+        WHERE doc_id = CAST(#{docId} AS uuid)
+        ORDER BY created_at ASC
+    </select>
+
+    <delete id="deleteByDocId">
+        DELETE FROM chunk_bge_m3
+        WHERE doc_id = CAST(#{docId} AS uuid)
+    </delete>
 </mapper>

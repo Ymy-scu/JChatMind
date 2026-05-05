@@ -23,6 +23,8 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
 
+import reactor.core.publisher.Flux;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -66,7 +68,7 @@ public class JChatMind {
     // 最多循环次数
     private static final Integer MAX_STEPS = 20;
 
-    private static final Integer DEFAULT_MAX_MESSAGES = 20;
+    private static final Integer DEFAULT_MAX_MESSAGES = 100;
 
     // SpringAI 自带的 ChatOptions, 不是 AgentDTO.ChatOptions
     private ChatOptions chatOptions;
@@ -219,29 +221,37 @@ public class JChatMind {
     // thinkPrompt 应该放到 system 中还是
     private boolean think() {
         String thinkPrompt = """
-                现在你是一个智能的的具体「决策模块」
-                请根据当前对话上下文，决定下一步的动作。
-                                \s
-                【额外信息】
-                - 你目前拥有的知识库列表以及描述：%s
-                - 如果有缺失的上下文时，优先从知识库中进行搜索
+                你可以调用工具获取信息。拿到工具返回结果后，必须用自然语言总结给用户。
+                可用的知识库：%s
                 """.formatted(this.availableKbs);
 
-        // 将 thinkPrompt 通过 .user(thinkPrompt) 的方式构造进入 chatClient 中
-        // 既能让每次 messageList 的最后一条是 本条提示词，
-        // 又能够避免将 thinkPrompt 加入到聊天记录中
         Prompt prompt = Prompt.builder()
                 .chatOptions(this.chatOptions)
                 .messages(this.chatMemory.get(this.chatSessionId))
                 .build();
 
+        final StringBuilder fullContent = new StringBuilder();
+
         this.lastChatResponse = this.chatClient
                 .prompt(prompt)
                 .system(thinkPrompt)
                 .toolCallbacks(this.availableTools.toArray(new ToolCallback[0]))
-                .call()
-                .chatClientResponse()
-                .chatResponse();
+                .stream()
+                .chatResponse()
+                .doOnNext(response -> {
+                    String text = response.getResult().getOutput().getText();
+                    if (text != null && !text.isEmpty()) {
+                        fullContent.append(text);
+                        SseMessage delta = SseMessage.builder()
+                                .type(SseMessage.Type.AI_CONTENT_DELTA)
+                                .payload(SseMessage.Payload.builder()
+                                        .contentDelta(text)
+                                        .build())
+                                .build();
+                        sseService.send(this.chatSessionId, delta);
+                    }
+                })
+                .blockLast();
 
         Assert.notNull(lastChatResponse, "Last chat client response cannot be null");
 
@@ -251,14 +261,22 @@ public class JChatMind {
 
         List<AssistantMessage.ToolCall> toolCalls = output.getToolCalls();
 
-        // 保存
-        saveMessage(output);
+        ChatMessageDTO chatMessageDTO = ChatMessageDTO.builder()
+                .role(ChatMessageDTO.RoleType.ASSISTANT)
+                .content(fullContent.toString())
+                .sessionId(this.chatSessionId)
+                .metadata(ChatMessageDTO.MetaData.builder()
+                        .toolCalls(toolCalls)
+                        .build())
+                .build();
+        CreateChatMessageResponse saved = chatMessageFacadeService.createChatMessage(chatMessageDTO);
+        chatMessageDTO.setId(saved.getChatMessageId());
+        pendingChatMessages.add(chatMessageDTO);
+
         refreshPendingMessages();
 
-        // 打印工具调用
         logToolCalls(toolCalls);
 
-        // 如果工具调用不为空，则进入执行阶段
         return !toolCalls.isEmpty();
     }
 
@@ -333,6 +351,12 @@ public class JChatMind {
             agentState = AgentState.ERROR;
             log.error("Error running agent", e);
             throw new RuntimeException("Error running agent", e);
+        } finally {
+            SseMessage doneMsg = SseMessage.builder()
+                    .type(SseMessage.Type.AI_DONE)
+                    .payload(SseMessage.Payload.builder().build())
+                    .build();
+            sseService.send(this.chatSessionId, doneMsg);
         }
     }
 

@@ -27,4 +27,8 @@ public interface ChunkBgeM3Mapper {
             @Param("vectorLiteral") String vectorLiteral,
             @Param("limit") int limit
     );
+
+    List<ChunkBgeM3> selectByDocId(@Param("docId") String docId);
+
+    int deleteByDocId(@Param("docId") String docId);
 }

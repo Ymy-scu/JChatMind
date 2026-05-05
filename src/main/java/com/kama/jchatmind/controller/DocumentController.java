@@ -56,4 +56,11 @@ public class DocumentController {
         documentFacadeService.updateDocument(documentId, request);
         return ApiResponse.success();
     }
+
+    // 解析文档（对已上传的 Markdown 文档进行分段解析并生成 chunks）
+    @PostMapping("/documents/{documentId}/parse")
+    public ApiResponse<Void> parseDocument(@PathVariable String documentId) {
+        documentFacadeService.parseDocument(documentId);
+        return ApiResponse.success();
+    }
 }

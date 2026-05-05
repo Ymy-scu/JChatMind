@@ -28,5 +28,6 @@ public interface MarkdownParserService {
     class MarkdownSection {
         private String title;
         private String content;
+        private Integer headingLevel;
     }
 }

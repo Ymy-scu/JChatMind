@@ -69,19 +69,38 @@
         ORDER BY created_at ASC
     </select>
 
+<!--    查询最近历史会话，从第一条开始查询，有问题-->
+<!--    <select id="selectBySessionIdRecently" resultMap="BaseResultMap">-->
+<!--        SELECT id,-->
+<!--               session_id,-->
+<!--               role,-->
+<!--               content,-->
+<!--               metadata::text AS metadata,-->
+<!--               created_at,-->
+<!--               updated_at-->
+<!--        FROM chat_message-->
+<!--        WHERE session_id = CAST(#{sessionId} AS uuid)-->
+<!--        ORDER BY created_at-->
+<!--        LIMIT #{limit}-->
+<!--    </select>-->
+<!--    查询历史会话从最后一条开始查询，然后按照时间升序排序-->
     <select id="selectBySessionIdRecently" resultMap="BaseResultMap">
-        SELECT id,
-               session_id,
-               role,
-               content,
-               metadata::text AS metadata,
-               created_at,
-               updated_at
-        FROM chat_message
-        WHERE session_id = CAST(#{sessionId} AS uuid)
-        ORDER BY created_at
-        LIMIT #{limit}
+        SELECT * FROM (
+                          SELECT id,
+                                 session_id,
+                                 role,
+                                 content,
+                                 metadata::text AS metadata,
+                              created_at,
+                                 updated_at
+                          FROM chat_message
+                          WHERE session_id = CAST(#{sessionId} AS uuid)
+                          ORDER BY created_at DESC
+                          LIMIT #{limit}
+                      ) AS recent_messages
+        ORDER BY created_at ASC
     </select>
+
 
     <delete id="deleteById">
         DELETE FROM chat_message WHERE id = CAST(#{id} AS uuid)

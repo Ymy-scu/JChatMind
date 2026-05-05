@@ -1,10 +1,12 @@
 package com.kama.jchatmind.service.impl;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kama.jchatmind.converter.DocumentConverter;
 import com.kama.jchatmind.exception.BizException;
 import com.kama.jchatmind.mapper.DocumentMapper;
 import com.kama.jchatmind.model.dto.DocumentDTO;
+import com.kama.jchatmind.model.dto.ChunkBgeM3DTO;
 import com.kama.jchatmind.model.entity.Document;
 import com.kama.jchatmind.model.request.CreateDocumentRequest;
 import com.kama.jchatmind.model.request.UpdateDocumentRequest;
@@ -41,6 +43,7 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
     private final MarkdownParserService markdownParserService;
     private final RagService ragService;
     private final ChunkBgeM3Mapper chunkBgeM3Mapper;
+    private final ObjectMapper objectMapper;
 
     @Override
     public GetDocumentsResponse getDocuments() {
@@ -158,14 +161,6 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
 
             log.info("文档上传成功: kbId={}, documentId={}, filename={}", kbId, documentId, originalFilename);
 
-            // 如果是 Markdown 文件，进行解析并生成 chunks
-            if ("md".equalsIgnoreCase(filetype) || "markdown".equalsIgnoreCase(filetype)) {
-                processMarkdownDocument(kbId, documentId, filePath);
-            } else {
-                // TODO: 未来可以增加其他文件类型的处理逻辑
-                log.warn("待新增处理的文件类型: {}", filetype);
-            }
-
             return CreateDocumentResponse.builder()
                     .documentId(documentId)
                     .build();
@@ -181,6 +176,9 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
         if (document == null) {
             throw new BizException("文档不存在: " + documentId);
         }
+
+        // 删除关联的 chunks
+        chunkBgeM3Mapper.deleteByDocId(documentId);
 
         // 删除文件
         try {
@@ -198,6 +196,32 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
         int result = documentMapper.deleteById(documentId);
         if (result <= 0) {
             throw new BizException("删除文档失败");
+        }
+    }
+
+    @Override
+    public void parseDocument(String documentId) {
+        Document document = documentMapper.selectById(documentId);
+        if (document == null) {
+            throw new BizException("文档不存在: " + documentId);
+        }
+
+        try {
+            DocumentDTO documentDTO = documentConverter.toDTO(document);
+            if (documentDTO.getMetadata() == null || documentDTO.getMetadata().getFilePath() == null) {
+                throw new BizException("文档文件路径不存在");
+            }
+            String filePath = documentDTO.getMetadata().getFilePath();
+            String filetype = document.getFiletype();
+
+            if (!"md".equalsIgnoreCase(filetype) && !"markdown".equalsIgnoreCase(filetype)) {
+                throw new BizException("仅支持解析 Markdown 文件，当前文件类型: " + filetype);
+            }
+
+            chunkBgeM3Mapper.deleteByDocId(documentId);
+            processMarkdownDocument(document.getKbId(), documentId, filePath);
+        } catch (JsonProcessingException e) {
+            throw new BizException("解析文档时序列化错误: " + e.getMessage());
         }
     }
 
@@ -224,8 +248,8 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
                 LocalDateTime now = LocalDateTime.now();
                 int chunkCount = 0;
 
-                // 为每个章节生成 chunk
-                for (MarkdownParserService.MarkdownSection section : sections) {
+                for (int idx = 0; idx < sections.size(); idx++) {
+                    MarkdownParserService.MarkdownSection section = sections.get(idx);
                     String title = section.getTitle();
                     String content = section.getContent();
 
@@ -233,15 +257,19 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
                         continue;
                     }
 
-                    // 对标题进行 embedding
                     float[] embedding = ragService.embed(title);
 
-                    // 创建 ChunkBgeM3 实体
+                    ChunkBgeM3DTO.MetaData metaData = new ChunkBgeM3DTO.MetaData();
+                    metaData.setTitle(title);
+                    metaData.setHeadingLevel(section.getHeadingLevel() != null ? section.getHeadingLevel() : 1);
+                    metaData.setSortOrder(idx);
+                    String metadataJson = objectMapper.writeValueAsString(metaData);
+
                     ChunkBgeM3 chunk = ChunkBgeM3.builder()
                             .kbId(kbId)
                             .docId(documentId)
                             .content(content != null ? content : "")
-                            .metadata(null) // 可以存储标题信息到 metadata
+                            .metadata(metadataJson)
                             .embedding(embedding)
                             .createdAt(now)
                             .updatedAt(now)

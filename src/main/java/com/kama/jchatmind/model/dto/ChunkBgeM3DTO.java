@@ -26,5 +26,8 @@ public class ChunkBgeM3DTO {
 
     @Data
     public static class MetaData {
+        private String title;
+        private Integer headingLevel;
+        private Integer sortOrder;
     }
 }
