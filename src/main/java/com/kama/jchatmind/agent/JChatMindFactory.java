@@ -14,6 +14,7 @@ import com.kama.jchatmind.model.dto.KnowledgeBaseDTO;
 import com.kama.jchatmind.model.entity.Agent;
 import com.kama.jchatmind.model.entity.KnowledgeBase;
 import com.kama.jchatmind.service.ChatMessageFacadeService;
+import com.kama.jchatmind.service.RagService;
 import com.kama.jchatmind.service.SseService;
 import com.kama.jchatmind.service.ToolFacadeService;
 import org.slf4j.Logger;
@@ -77,6 +78,9 @@ public class JChatMindFactory {
     /** 聊天消息转换器，用于 DTO 和 VO 之间的转换 */
     private final ChatMessageConverter chatMessageConverter;
 
+    /** RAG 服务，用于知识检索 */
+    private final RagService ragService;
+
     /** 运行时 Agent 配置（在 create 方法中设置） */
     private AgentDTO agentConfig;
 
@@ -92,7 +96,8 @@ public class JChatMindFactory {
             KnowledgeBaseConverter knowledgeBaseConverter,
             ToolFacadeService toolFacadeService,
             ChatMessageFacadeService chatMessageFacadeService,
-            ChatMessageConverter chatMessageConverter
+            ChatMessageConverter chatMessageConverter,
+            RagService ragService
     ) {
         this.chatClientRegistry = chatClientRegistry;
         this.sseService = sseService;
@@ -103,6 +108,7 @@ public class JChatMindFactory {
         this.toolFacadeService = toolFacadeService;
         this.chatMessageFacadeService = chatMessageFacadeService;
         this.chatMessageConverter = chatMessageConverter;
+        this.ragService = ragService;
     }
 
     /**
@@ -365,19 +371,20 @@ public class JChatMindFactory {
 
         // ② 创建 JChatMind 实例，传入所有必需的配置
         return new JChatMind(
-                agent.getId(),                                    // Agent ID
-                agent.getName(),                                  // Agent 名称
-                agent.getDescription(),                           // Agent 描述
-                agent.getSystemPrompt(),                          // 系统提示词
-                chatClient,                                       // ChatClient（AI 模型交互实例）
-                null,                                           // 最大记忆消息数（null 使用默认 100）
-                memory,                                           // 历史对话记忆
-                toolCallbacks,                                    // 工具回调列表
-                knowledgeBases,                                   // 允许访问的知识库
-                chatSessionId,                                    // 当前会话 ID
-                sseService,                                       // SSE 推送服务
-                chatMessageFacadeService,                         // 消息管理服务
-                chatMessageConverter                              // 消息转换器
+                agent.getId(),
+                agent.getName(),
+                agent.getDescription(),
+                agent.getSystemPrompt(),
+                chatClient,
+                null,
+                memory,
+                toolCallbacks,
+                knowledgeBases,
+                chatSessionId,
+                sseService,
+                chatMessageFacadeService,
+                chatMessageConverter,
+                ragService
         );
     }
 

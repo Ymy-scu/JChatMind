@@ -8,10 +8,24 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 @Component
 @Slf4j
 public class DataBaseTools implements Tool {
+
+    private static final Set<String> FORBIDDEN_KEYWORDS = Set.of(
+            "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
+            "GRANT", "REVOKE", "MERGE", "REPLACE", "LOAD", "COPY",
+            "INTO OUTFILE", "INTO DUMPFILE", "FOR UPDATE", "FOR SHARE",
+            "EXEC", "EXECUTE", "CALL"
+    );
+
+    private static final Pattern CLEAN_SQL = Pattern.compile(
+            "\\b(" + String.join("|", FORBIDDEN_KEYWORDS) + ")\\b", Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern MULTI_STATEMENT = Pattern.compile(";\\s*\\S");
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -34,20 +48,25 @@ public class DataBaseTools implements Tool {
         return ToolType.OPTIONAL;
     }
 
-    /**
-     * 执行一条 SQL 查询，从数据库中进行查询数据
-     *
-     * @param sql SQL 查询语句（仅支持 SELECT 查询）
-     * @return 格式化的查询结果字符串
-     */
     @org.springframework.ai.tool.annotation.Tool(name = "databaseQuery", description = "用于在 PostgreSQL 中执行只读查询（SELECT）。接收由模型生成的查询语句，并返回结构化数据结果。该工具仅用于检索数据，严禁任何写入或修改数据库的语句。")
     public String query(String sql) {
         try {
-            // 验证 SQL 语句安全性（只允许 SELECT 查询）
-            String trimmedSql = sql.trim().toUpperCase();
-            if (!trimmedSql.startsWith("SELECT")) {
+            String trimmedSql = sql.trim();
+
+            if (MULTI_STATEMENT.matcher(trimmedSql).find()) {
+                log.warn("拒绝执行多条语句: {}", sql);
+                return "错误：不允许执行多条 SQL 语句。";
+            }
+
+            if (CLEAN_SQL.matcher(trimmedSql).find()) {
                 log.warn("拒绝执行非 SELECT 查询: {}", sql);
-                return "错误：仅支持 SELECT 查询语句。提供的 SQL: " + sql;
+                return "错误：仅支持 SELECT 查询，禁止 INSERT/UPDATE/DELETE/DROP 等操作。";
+            }
+
+            String upperSql = trimmedSql.toUpperCase();
+            if (!upperSql.startsWith("SELECT") && !upperSql.startsWith("WITH") && !upperSql.startsWith("EXPLAIN")) {
+                log.warn("拒绝执行非查询语句: {}", sql);
+                return "错误：仅支持 SELECT/WITH/EXPLAIN 查询。";
             }
 
             // 执行查询
