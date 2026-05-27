@@ -7,6 +7,7 @@ import com.kama.jchatmind.model.dto.KnowledgeBaseDTO;
 import com.kama.jchatmind.model.response.CreateChatMessageResponse;
 import com.kama.jchatmind.model.vo.ChatMessageVO;
 import com.kama.jchatmind.service.ChatMessageFacadeService;
+import com.kama.jchatmind.service.RagService;
 import com.kama.jchatmind.service.SseService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -32,59 +33,27 @@ import java.util.stream.IntStream;
 
 @Slf4j
 public class JChatMind {
-    // 智能体 ID
+
     private String agentId;
-
-    // 名称
     private String name;
-
-    // 描述
     private String description;
-
-    // 默认系统提示词
     private String systemPrompt;
-
-    // 交互实例
     private ChatClient chatClient;
-
-    // 状态
     private AgentState agentState;
-
-    // 可用的工具
     private List<ToolCallback> availableTools;
-
-    // 可访问的知识库
     private List<KnowledgeBaseDTO> availableKbs;
-
-    // 工具调用管理器
     private ToolCallingManager toolCallingManager;
-
-    // 模型的聊天记录
     private ChatMemory chatMemory;
-
-    // 模型的聊天会话 ID
     private String chatSessionId;
-
-    // 最多循环次数
     private static final Integer MAX_STEPS = 20;
-
     private static final Integer DEFAULT_MAX_MESSAGES = 100;
-
-    // SpringAI 自带的 ChatOptions, 不是 AgentDTO.ChatOptions
     private ChatOptions chatOptions;
-
-    // SSE 服务, 用于发送消息给前端
     private SseService sseService;
-
     private ChatMessageConverter chatMessageConverter;
-
     private ChatMessageFacadeService chatMessageFacadeService;
-
-    // 最后一次的 ChatResponse
     private ChatResponse lastChatResponse;
-
-    // AI 返回的，已经持久化，但是需要 sse 发给前端的消息
-    private final List<ChatMessageDTO> pendingChatMessages = new ArrayList<>();
+    private RagService ragService;
+    private static final double SIMILARITY_THRESHOLD = 0.7;
 
     public JChatMind() {
     }
@@ -101,50 +70,135 @@ public class JChatMind {
                      String chatSessionId,
                      SseService sseService,
                      ChatMessageFacadeService chatMessageFacadeService,
-                     ChatMessageConverter chatMessageConverter
+                     ChatMessageConverter chatMessageConverter,
+                     RagService ragService
     ) {
         this.agentId = agentId;
         this.name = name;
         this.description = description;
         this.systemPrompt = systemPrompt;
-
         this.chatClient = chatClient;
-
         this.availableTools = availableTools;
         this.availableKbs = availableKbs;
-
         this.chatSessionId = chatSessionId;
         this.sseService = sseService;
-
         this.chatMessageFacadeService = chatMessageFacadeService;
         this.chatMessageConverter = chatMessageConverter;
-
+        this.ragService = ragService;
         this.agentState = AgentState.IDLE;
 
-        // 保存聊天记录
         this.chatMemory = MessageWindowChatMemory.builder()
                 .maxMessages(maxMessages == null ? DEFAULT_MAX_MESSAGES : maxMessages)
                 .build();
         this.chatMemory.add(chatSessionId, memory);
 
-        // 添加系统提示
         if (StringUtils.hasLength(systemPrompt)) {
             this.chatMemory.add(chatSessionId, new SystemMessage(systemPrompt));
         }
 
-        // 关闭 SpringAI 自带的内部的工具调用自动执行功能
         this.chatOptions = DefaultToolCallingChatOptions.builder()
                 .internalToolExecutionEnabled(false)
                 .build();
 
-        // 工具调用管理器
         this.toolCallingManager = ToolCallingManager.builder().build();
     }
 
-    // 打印工具调用信息
+    private void ensureKnowledgeContext() {
+        if (availableKbs == null || availableKbs.isEmpty() || ragService == null) {
+            return;
+        }
+
+        List<Message> messages = chatMemory.get(chatSessionId);
+        String currentQuery = extractLastUserMessage(messages);
+        if (!StringUtils.hasText(currentQuery)) {
+            return;
+        }
+
+        List<ToolResponseMessage> historyResults = messages.stream()
+                .filter(m -> m instanceof ToolResponseMessage)
+                .map(m -> (ToolResponseMessage) m)
+                .filter(m -> m.getResponses().stream()
+                        .anyMatch(r -> r.name().equals("KnowledgeTool")))
+                .toList();
+
+        if (!historyResults.isEmpty()) {
+            float[] currentEmbedding;
+            try {
+                currentEmbedding = ragService.embed(currentQuery);
+            } catch (Exception e) {
+                log.warn("Failed to embed current query for similarity check", e);
+                return;
+            }
+
+            boolean relevantFound = historyResults.stream().anyMatch(result -> {
+                String historyContent = extractKnowledgeContent(result);
+                if (!StringUtils.hasText(historyContent)) {
+                    return false;
+                }
+                try {
+                    float[] historyEmbedding = ragService.embed(historyContent);
+                    double similarity = cosineSimilarity(currentEmbedding, historyEmbedding);
+                    return similarity > SIMILARITY_THRESHOLD;
+                } catch (Exception e) {
+                    log.warn("Failed to compute similarity with history result", e);
+                    return false;
+                }
+            });
+
+            if (relevantFound) {
+                log.info("Found relevant knowledge from history, skipping RAG retrieval");
+                return;
+            }
+        }
+
+        for (KnowledgeBaseDTO kb : availableKbs) {
+            try {
+                List<String> results = ragService.similaritySearch(kb.getId(), currentQuery);
+                if (results != null && !results.isEmpty()) {
+                    String resultContent = String.join("\n", results);
+                    String knowledgeContext = "【知识库检索结果】\n" + resultContent;
+                    chatMemory.add(chatSessionId, new SystemMessage(knowledgeContext));
+                    log.info("Pre-retrieved knowledge for kb: {}, results count: {}", kb.getId(), results.size());
+                }
+            } catch (Exception e) {
+                log.warn("Failed to pre-retrieve knowledge from kb: {}", kb.getId(), e);
+            }
+        }
+    }
+
+    private String extractLastUserMessage(List<Message> messages) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            Message msg = messages.get(i);
+            if (msg instanceof UserMessage) {
+                return ((UserMessage) msg).getText();
+            }
+        }
+        return null;
+    }
+
+    private String extractKnowledgeContent(ToolResponseMessage toolResponse) {
+        return toolResponse.getResponses().stream()
+                .filter(r -> r.name().equals("KnowledgeTool"))
+                .map(r -> r.responseData())
+                .collect(Collectors.joining("\n"));
+    }
+
+    private double cosineSimilarity(float[] a, float[] b) {
+        if (a.length != b.length) {
+            return 0;
+        }
+        double dot = 0, normA = 0, normB = 0;
+        for (int i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            normA += a[i] * a[i];
+            normB += b[i] * b[i];
+        }
+        double denom = Math.sqrt(normA) * Math.sqrt(normB);
+        return denom == 0 ? 0 : dot / denom;
+    }
+
     private void logToolCalls(List<AssistantMessage.ToolCall> toolCalls) {
         if (toolCalls == null || toolCalls.isEmpty()) {
-            log.info("\n\n[ToolCalling] 无工具调用");
             return;
         }
         String logMessage = IntStream.range(0, toolCalls.size())
@@ -161,68 +215,41 @@ public class JChatMind {
         log.info("\n\n========== Tool Calling ==========\n{}\n=================================\n", logMessage);
     }
 
-    // 持久化 Message, 返回 chatMessageId
-    // 需要 Agent 持久化的 Message 子类有以下两类
-    // AssistantMessage
-    // ToolResponseMessage
+    private void persistAndSend(ChatMessageDTO chatMessageDTO) {
+        CreateChatMessageResponse saved = chatMessageFacadeService.createChatMessage(chatMessageDTO);
+        chatMessageDTO.setId(saved.getChatMessageId());
 
-    // SystemMessage 不需要持久化
-    // UserMessage 在每次用户发送问题之间就已经持久化过了
-    private void saveMessage(Message message) {
-        ChatMessageDTO.ChatMessageDTOBuilder builder = ChatMessageDTO.builder();
-        if (message instanceof AssistantMessage assistantMessage) {
-            ChatMessageDTO chatMessageDTO = builder.role(ChatMessageDTO.RoleType.ASSISTANT)
-                    .content(assistantMessage.getText())
-                    .sessionId(this.chatSessionId)
-                    .metadata(ChatMessageDTO.MetaData.builder()
-                            .toolCalls(assistantMessage.getToolCalls())
-                            .build())
-                    .build();
-            CreateChatMessageResponse chatMessage = chatMessageFacadeService.createChatMessage(chatMessageDTO);
-            chatMessageDTO.setId(chatMessage.getChatMessageId());
-            pendingChatMessages.add(chatMessageDTO);
-        } else if (message instanceof ToolResponseMessage toolResponseMessage) {
-            // 持久化 ToolResponseMessage
-            for (ToolResponseMessage.ToolResponse toolResponse : toolResponseMessage.getResponses()) {
-                ChatMessageDTO chatMessageDTO = builder.role(ChatMessageDTO.RoleType.TOOL)
-                        .content(toolResponse.responseData())
-                        .sessionId(this.chatSessionId)
-                        .metadata(ChatMessageDTO.MetaData.builder()
-                                .toolResponse(toolResponse)
-                                .build())
-                        .build();
-                CreateChatMessageResponse chatMessage = chatMessageFacadeService.createChatMessage(chatMessageDTO);
-                chatMessageDTO.setId(chatMessage.getChatMessageId());
-                pendingChatMessages.add(chatMessageDTO);
-            }
-        } else {
-            throw new IllegalArgumentException("不支持的 Message 类型: " + message.getClass().getName());
-        }
+        ChatMessageVO vo = chatMessageConverter.toVO(chatMessageDTO);
+        SseMessage sseMessage = SseMessage.builder()
+                .type(SseMessage.Type.AI_GENERATED_CONTENT)
+                .payload(SseMessage.Payload.builder()
+                        .message(vo)
+                        .build())
+                .metadata(SseMessage.Metadata.builder()
+                        .chatMessageId(saved.getChatMessageId())
+                        .build())
+                .build();
+        sseService.send(this.chatSessionId, sseMessage);
     }
 
-    // 刷新 pendingMessages, 将数据通过 sse 发送给前端
-    private void refreshPendingMessages() {
-        for (ChatMessageDTO message : pendingChatMessages) {
-            ChatMessageVO vo = chatMessageConverter.toVO(message);
-            SseMessage sseMessage = SseMessage.builder()
-                    .type(SseMessage.Type.AI_GENERATED_CONTENT)
-                    .payload(SseMessage.Payload.builder()
-                            .message(vo)
-                            .build())
-                    .metadata(SseMessage.Metadata.builder()
-                            .chatMessageId(message.getId())
-                            .build())
-                    .build();
-            sseService.send(this.chatSessionId, sseMessage);
-        }
-        pendingChatMessages.clear();
+    private void sendContentDelta(String text) {
+        SseMessage delta = SseMessage.builder()
+                .type(SseMessage.Type.AI_CONTENT_DELTA)
+                .payload(SseMessage.Payload.builder()
+                        .contentDelta(text)
+                        .build())
+                .build();
+        sseService.send(this.chatSessionId, delta);
     }
 
-    // thinkPrompt 应该放到 system 中还是
     private boolean think() {
+        ensureKnowledgeContext();
+
         String thinkPrompt = """
                 你可以调用工具获取信息。拿到工具返回结果后，必须用自然语言总结给用户。
                 可用的知识库：%s
+                当用户的问题与知识库相关时，你必须先调用 KnowledgeTool 工具在知识库中进行检索，然后再回答问题。
+                如果提供了知识库ID，请优先使用 KnowledgeTool 进行检索。
                 """.formatted(this.availableKbs);
 
         Prompt prompt = Prompt.builder()
@@ -242,23 +269,14 @@ public class JChatMind {
                     String text = response.getResult().getOutput().getText();
                     if (text != null && !text.isEmpty()) {
                         fullContent.append(text);
-                        SseMessage delta = SseMessage.builder()
-                                .type(SseMessage.Type.AI_CONTENT_DELTA)
-                                .payload(SseMessage.Payload.builder()
-                                        .contentDelta(text)
-                                        .build())
-                                .build();
-                        sseService.send(this.chatSessionId, delta);
+                        sendContentDelta(text);
                     }
                 })
                 .blockLast();
 
         Assert.notNull(lastChatResponse, "Last chat client response cannot be null");
 
-        AssistantMessage output = this.lastChatResponse
-                .getResult()
-                .getOutput();
-
+        AssistantMessage output = this.lastChatResponse.getResult().getOutput();
         List<AssistantMessage.ToolCall> toolCalls = output.getToolCalls();
 
         ChatMessageDTO chatMessageDTO = ChatMessageDTO.builder()
@@ -269,18 +287,18 @@ public class JChatMind {
                         .toolCalls(toolCalls)
                         .build())
                 .build();
-        CreateChatMessageResponse saved = chatMessageFacadeService.createChatMessage(chatMessageDTO);
-        chatMessageDTO.setId(saved.getChatMessageId());
-        pendingChatMessages.add(chatMessageDTO);
+        persistAndSend(chatMessageDTO);
 
-        refreshPendingMessages();
+        this.chatMemory.add(this.chatSessionId, AssistantMessage.builder()
+                .content(fullContent.toString())
+                .toolCalls(toolCalls)
+                .build());
 
         logToolCalls(toolCalls);
 
         return !toolCalls.isEmpty();
     }
 
-    // 执行
     private void execute() {
         Assert.notNull(this.lastChatResponse, "Last chat client response cannot be null");
 
@@ -295,9 +313,6 @@ public class JChatMind {
 
         ToolExecutionResult toolExecutionResult = toolCallingManager.executeToolCalls(prompt, this.lastChatResponse);
 
-        this.chatMemory.clear(this.chatSessionId);
-        this.chatMemory.add(this.chatSessionId, toolExecutionResult.conversationHistory());
-
         ToolResponseMessage toolResponseMessage = (ToolResponseMessage) toolExecutionResult
                 .conversationHistory()
                 .get(toolExecutionResult.conversationHistory().size() - 1);
@@ -309,9 +324,19 @@ public class JChatMind {
 
         log.info("工具调用结果：{}", collect);
 
-        // 保存工具调用
-        saveMessage(toolResponseMessage);
-        refreshPendingMessages();
+        this.chatMemory.add(this.chatSessionId, toolResponseMessage);
+
+        for (ToolResponseMessage.ToolResponse toolResponse : toolResponseMessage.getResponses()) {
+            ChatMessageDTO chatMessageDTO = ChatMessageDTO.builder()
+                    .role(ChatMessageDTO.RoleType.TOOL)
+                    .content(toolResponse.responseData())
+                    .sessionId(this.chatSessionId)
+                    .metadata(ChatMessageDTO.MetaData.builder()
+                            .toolResponse(toolResponse)
+                            .build())
+                    .build();
+            persistAndSend(chatMessageDTO);
+        }
 
         if (toolResponseMessage.getResponses()
                 .stream()
@@ -321,16 +346,14 @@ public class JChatMind {
         }
     }
 
-    // 单个步骤模板
     private void step() {
         if (think()) {
             execute();
-        } else { // 没有工具调用
+        } else {
             agentState = AgentState.FINISHED;
         }
     }
 
-    // 运行
     public void run() {
         if (agentState != AgentState.IDLE) {
             throw new IllegalStateException("Agent is not idle");
@@ -338,7 +361,6 @@ public class JChatMind {
 
         try {
             for (int i = 0; i < MAX_STEPS && agentState != AgentState.FINISHED; i++) {
-                // 当前步骤，用于实现 Agent Loop
                 int currentStep = i + 1;
                 step();
                 if (currentStep >= MAX_STEPS) {
