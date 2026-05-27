@@ -4,23 +4,31 @@ import com.kama.jchatmind.mapper.ChunkBgeM3Mapper;
 import com.kama.jchatmind.model.entity.ChunkBgeM3;
 import com.kama.jchatmind.service.RagService;
 import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.util.Assert;
 import org.springframework.web.reactive.function.client.WebClient;
 
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 public class RagServiceImpl implements RagService {
 
-    // 封装本地的模型调用
     private final WebClient webClient;
     private final ChunkBgeM3Mapper chunkBgeM3Mapper;
+    private final boolean enabled;
 
-    public RagServiceImpl(WebClient.Builder builder, ChunkBgeM3Mapper chunkBgeM3Mapper) {
-        this.webClient = builder.baseUrl("http://localhost:11434").build();
+    public RagServiceImpl(
+            WebClient.Builder builder,
+            ChunkBgeM3Mapper chunkBgeM3Mapper,
+            @Value("${embedding.url:http://localhost:11434}") String embeddingUrl,
+            @Value("${embedding.enabled:true}") boolean enabled
+    ) {
+        this.webClient = builder.baseUrl(embeddingUrl).build();
         this.chunkBgeM3Mapper = chunkBgeM3Mapper;
+        this.enabled = enabled;
     }
 
     @Data
@@ -29,6 +37,9 @@ public class RagServiceImpl implements RagService {
     }
 
     private float[] doEmbed(String text) {
+        if (!enabled) {
+            throw new RuntimeException("Embedding 服务未启用");
+        }
         EmbeddingResponse resp = webClient.post()
                 .uri("/api/embeddings")
                 .bodyValue(Map.of(
@@ -38,7 +49,9 @@ public class RagServiceImpl implements RagService {
                 .retrieve()
                 .bodyToMono(EmbeddingResponse.class)
                 .block();
-        Assert.notNull(resp, "Embedding response cannot be null");
+        if (resp == null || resp.getEmbedding() == null) {
+            throw new RuntimeException("Embedding 返回为空");
+        }
         return resp.getEmbedding();
     }
 
@@ -49,9 +62,28 @@ public class RagServiceImpl implements RagService {
 
     @Override
     public List<String> similaritySearch(String kbId, String title) {
-        String queryEmbedding = toPgVector(doEmbed(title));
-        List<ChunkBgeM3> chunks = chunkBgeM3Mapper.similaritySearch(kbId, queryEmbedding, 3);
-        return chunks.stream().map(ChunkBgeM3::getContent).toList();
+        return multiQuerySimilaritySearch(kbId, List.of(title), 3);
+    }
+
+    @Override
+    public List<String> multiQuerySimilaritySearch(String kbId, List<String> queries, int topK) {
+        Set<String> seenContent = new LinkedHashSet<>();
+
+        for (String query : queries) {
+            try {
+                String queryEmbedding = toPgVector(doEmbed(query));
+                List<ChunkBgeM3> chunks = chunkBgeM3Mapper.similaritySearch(kbId, queryEmbedding, topK);
+                for (ChunkBgeM3 chunk : chunks) {
+                    seenContent.add(chunk.getContent());
+                }
+            } catch (Exception e) {
+                log.error("查询 '{}' 检索失败", query, e);
+            }
+        }
+
+        List<String> results = new ArrayList<>(seenContent);
+        log.info("多查询检索完成: 查询数={}, 返回结果数={}", queries.size(), results.size());
+        return results;
     }
 
     private String toPgVector(float[] v) {

@@ -16,6 +16,7 @@ import com.kama.jchatmind.model.entity.KnowledgeBase;
 import com.kama.jchatmind.service.ChatMessageFacadeService;
 import com.kama.jchatmind.service.SseService;
 import com.kama.jchatmind.service.ToolFacadeService;
+import com.kama.jchatmind.service.UserChatClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -53,6 +54,9 @@ public class JChatMindFactory {
     /** ChatClient 注册表，用于根据模型名称获取对应的 ChatClient */
     private final ChatClientRegistry chatClientRegistry;
 
+    /** 用户级别的 ChatClient 服务 */
+    private final UserChatClientService userChatClientService;
+
     /** SSE 推送服务，用于实时向前端发送消息 */
     private final SseService sseService;
 
@@ -85,6 +89,7 @@ public class JChatMindFactory {
      */
     public JChatMindFactory(
             ChatClientRegistry chatClientRegistry,
+            UserChatClientService userChatClientService,
             SseService sseService,
             AgentMapper agentMapper,
             AgentConverter agentConverter,
@@ -95,6 +100,7 @@ public class JChatMindFactory {
             ChatMessageConverter chatMessageConverter
     ) {
         this.chatClientRegistry = chatClientRegistry;
+        this.userChatClientService = userChatClientService;
         this.sseService = sseService;
         this.agentMapper = agentMapper;
         this.agentConverter = agentConverter;
@@ -347,6 +353,7 @@ public class JChatMindFactory {
      * @param knowledgeBases 允许访问的知识库列表
      * @param toolCallbacks 工具回调列表
      * @param chatSessionId 聊天会话 ID
+     * @param userId 用户 ID（可选，用于获取用户的自定义模型配置）
      * @return 配置完成的 JChatMind 实例
      * @throws IllegalStateException 如果找不到对应的 ChatClient
      */
@@ -355,10 +362,17 @@ public class JChatMindFactory {
             List<Message> memory,
             List<KnowledgeBaseDTO> knowledgeBases,
             List<ToolCallback> toolCallbacks,
-            String chatSessionId
+            String chatSessionId,
+            String userId
     ) {
-        // ① 从注册表中获取对应的 ChatClient（AI 模型）
-        ChatClient chatClient = chatClientRegistry.get(agent.getModel());
+        // ① 获取 ChatClient（支持用户级别配置）
+        ChatClient chatClient;
+        if (userId != null) {
+            chatClient = userChatClientService.getChatClient(userId, agent.getModel());
+        } else {
+            chatClient = chatClientRegistry.get(agent.getModel());
+        }
+        
         if (Objects.isNull(chatClient)) {
             throw new IllegalStateException("未找到对应的 ChatClient: " + agent.getModel());
         }
@@ -404,6 +418,18 @@ public class JChatMindFactory {
      * @return 配置完成、可立即运行的 JChatMind 实例
      */
     public JChatMind create(String agentId, String chatSessionId) {
+        return create(agentId, chatSessionId, null);
+    }
+
+    /**
+     * 创建 JChatMind Agent 实例（支持用户级别配置）
+     *
+     * @param agentId Agent 的唯一标识
+     * @param chatSessionId 聊天会话的唯一标识
+     * @param userId 用户 ID（可选，用于获取用户的自定义模型配置）
+     * @return 配置完成、可立即运行的 JChatMind 实例
+     */
+    public JChatMind create(String agentId, String chatSessionId, String userId) {
         // 步骤1: 从数据库加载 Agent 配置
         Agent agent = loadAgent(agentId);
 
@@ -428,7 +454,8 @@ public class JChatMindFactory {
                 memory,
                 knowledgeBases,
                 toolCallbacks,
-                chatSessionId
+                chatSessionId,
+                userId
         );
     }
 }

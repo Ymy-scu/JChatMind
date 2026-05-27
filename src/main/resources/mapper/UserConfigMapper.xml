@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.kama.jchatmind.mapper.UserConfigMapper">
+
+    <resultMap id="BaseResultMap" type="com.kama.jchatmind.model.entity.UserConfig">
+        <id property="id" column="id" jdbcType="VARCHAR"/>
+        <result property="userId" column="user_id" jdbcType="VARCHAR"/>
+        <result property="provider" column="provider" jdbcType="VARCHAR"/>
+        <result property="apiKey" column="api_key" jdbcType="VARCHAR"/>
+        <result property="baseUrl" column="base_url" jdbcType="VARCHAR"/>
+        <result property="modelName" column="model_name" jdbcType="VARCHAR"/>
+        <result property="isDefault" column="is_default" jdbcType="BOOLEAN"/>
+        <result property="config" column="config" jdbcType="VARCHAR"/>
+        <result property="createdAt" column="created_at" jdbcType="TIMESTAMP"/>
+        <result property="updatedAt" column="updated_at" jdbcType="TIMESTAMP"/>
+    </resultMap>
+
+    <sql id="Base_Column_List">
+        id, user_id, provider, api_key, base_url, model_name, is_default, config, created_at, updated_at
+    </sql>
+
+    <insert id="insert" parameterType="com.kama.jchatmind.model.entity.UserConfig"
+            keyColumn="id" keyProperty="id" useGeneratedKeys="true">
+        INSERT INTO user_config (user_id, provider, api_key, base_url, model_name, is_default, config)
+        VALUES (#{userId}, #{provider}, #{apiKey}, #{baseUrl}, #{modelName}, #{isDefault}, #{config}::jsonb)
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM user_config
+        WHERE id = #{id}
+    </select>
+
+    <select id="selectByUserId" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM user_config
+        WHERE user_id = #{userId}
+        ORDER BY is_default DESC, created_at ASC
+    </select>
+
+    <select id="selectDefaultByUserId" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM user_config
+        WHERE user_id = #{userId} AND is_default = TRUE
+        LIMIT 1
+    </select>
+
+    <update id="updateById" parameterType="com.kama.jchatmind.model.entity.UserConfig">
+        UPDATE user_config
+        <set>
+            <if test="provider != null">provider = #{provider},</if>
+            <if test="apiKey != null">api_key = #{apiKey},</if>
+            <if test="baseUrl != null">base_url = #{baseUrl},</if>
+            <if test="modelName != null">model_name = #{modelName},</if>
+            <if test="isDefault != null">is_default = #{isDefault},</if>
+            <if test="config != null">config = #{config}::jsonb,</if>
+            updated_at = NOW()
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM user_config
+        WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteByUserId">
+        DELETE FROM user_config
+        WHERE user_id = #{userId}
+    </delete>
+
+</mapper>
