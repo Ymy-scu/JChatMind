@@ -1,10 +1,11 @@
 HELP.md
 target/
-application.yaml
 .mvn/wrapper/maven-wrapper.jar
+# 本地密钥文件：只在本机保留，切勿提交
+src/main/resources/application-local.yaml
 !**/src/main/**/target/
 !**/src/test/**/target/
-
+data/
 ### STS ###
 .apt_generated
 .classpath
@@ -32,5 +33,8 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### CodeBuddy IDE local metadata ###
+.codebuddy/
 
 src/main/resources/application-dev.yaml

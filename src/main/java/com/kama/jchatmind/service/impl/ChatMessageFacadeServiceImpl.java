@@ -13,6 +13,7 @@ import com.kama.jchatmind.model.response.CreateChatMessageResponse;
 import com.kama.jchatmind.model.response.GetChatMessagesResponse;
 import com.kama.jchatmind.model.vo.ChatMessageVO;
 import com.kama.jchatmind.service.ChatMessageFacadeService;
+import com.kama.jchatmind.service.RedisChatMemoryService;
 import lombok.AllArgsConstructor;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
@@ -28,6 +29,7 @@ public class ChatMessageFacadeServiceImpl implements ChatMessageFacadeService {
     private final ChatMessageMapper chatMessageMapper;
     private final ChatMessageConverter chatMessageConverter;
     private final ApplicationEventPublisher publisher;
+    private final RedisChatMemoryService redisChatMemoryService;
 
     @Override
     public GetChatMessagesResponse getChatMessagesBySessionId(String sessionId) {
@@ -66,6 +68,17 @@ public class ChatMessageFacadeServiceImpl implements ChatMessageFacadeService {
     @Override
     public CreateChatMessageResponse createChatMessage(CreateChatMessageRequest request) {
         ChatMessage chatMessage = doCreateChatMessage(request);
+
+        // 将用户消息保存到 Redis（触发事件前，确保 Redis 中有完整对话）
+        try {
+            ChatMessageDTO userMessageDTO = chatMessageConverter.toDTO(chatMessage);
+            redisChatMemoryService.addMessage(chatMessage.getSessionId(), userMessageDTO);
+        } catch (Exception e) {
+            // Redis 保存失败不影响主流程，记日志即可
+            org.slf4j.LoggerFactory.getLogger(getClass())
+                    .warn("Failed to cache user message to Redis for session: {}", chatMessage.getSessionId(), e);
+        }
+
         // 发布聊天通知事件
         publisher.publishEvent(new ChatEvent(
                         request.getAgentId(),

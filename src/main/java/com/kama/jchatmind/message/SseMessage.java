@@ -1,9 +1,12 @@
 package com.kama.jchatmind.message;
 
 import com.kama.jchatmind.model.vo.ChatMessageVO;
+import com.kama.jchatmind.service.rag.RetrievedChunk;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+
+import java.util.List;
 
 @Data
 @AllArgsConstructor
@@ -22,6 +25,8 @@ public class SseMessage {
         private String contentDelta;
         private String statusText;
         private Boolean done;
+        /** 引用溯源结果，仅在 {@link Type#AI_REFERENCES} 事件中携带 */
+        private List<RetrievedChunk> references;
     }
 
     @Data
@@ -37,6 +42,7 @@ public class SseMessage {
     // 3. AI 思考中
     // 4. AI 执行中
     // 5. AI 完成
+    // 6. AI 引用溯源（RAG 命中的 chunk 元数据）
     public enum Type {
         AI_GENERATED_CONTENT,
         AI_CONTENT_DELTA,
@@ -44,5 +50,6 @@ public class SseMessage {
         AI_THINKING,
         AI_EXECUTING,
         AI_DONE,
+        AI_REFERENCES,
     }
 }

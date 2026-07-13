@@ -154,6 +154,32 @@ const AgentChatView: React.FC = () => {
         setDisplayAgentStatus(false);
         setAgentStatusText("");
         setAgentStatusType(undefined);
+      } else if (message.type === "AI_REFERENCES") {
+        // 把引用挂到最新一条 assistant 消息的 metadata.references
+        const refs = message.payload.references ?? [];
+        const targetId = message.metadata?.chatMessageId;
+        setMessages((prev) => {
+          if (prev.length === 0) return prev;
+          const next = [...prev];
+          const idx = targetId
+            ? next.findIndex((m) => m.id === targetId)
+            : [...next].reverse().findIndex((m) => m.role === "assistant");
+          const realIdx = targetId
+            ? idx
+            : idx < 0
+              ? -1
+              : next.length - 1 - idx;
+          if (realIdx < 0) return prev;
+          const target = next[realIdx];
+          next[realIdx] = {
+            ...target,
+            metadata: {
+              ...(target.metadata ?? {}),
+              references: refs,
+            },
+          };
+          return next;
+        });
       } else {
         throw new Error(`Unknown message type: ${message.type}`);
       }

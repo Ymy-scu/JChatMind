@@ -20,6 +20,9 @@ import com.kama.jchatmind.service.DocumentParserService;
 import com.kama.jchatmind.service.DocumentStorageService;
 import com.kama.jchatmind.service.MarkdownParserService;
 import com.kama.jchatmind.service.RagService;
+import com.kama.jchatmind.service.rag.Chunk;
+import com.kama.jchatmind.service.rag.ParsedChunk;
+import com.kama.jchatmind.service.rag.TokenAwareSplitter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -44,6 +47,7 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
     private final RagService ragService;
     private final ChunkBgeM3Mapper chunkBgeM3Mapper;
     private final ObjectMapper objectMapper;
+    private final TokenAwareSplitter tokenAwareSplitter;
 
     public DocumentFacadeServiceImpl(
             DocumentMapper documentMapper,
@@ -53,7 +57,8 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
             List<DocumentParserService> documentParsers,
             RagService ragService,
             ChunkBgeM3Mapper chunkBgeM3Mapper,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            TokenAwareSplitter tokenAwareSplitter) {
         this.documentMapper = documentMapper;
         this.documentConverter = documentConverter;
         this.documentStorageService = documentStorageService;
@@ -62,6 +67,7 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
         this.ragService = ragService;
         this.chunkBgeM3Mapper = chunkBgeM3Mapper;
         this.objectMapper = objectMapper;
+        this.tokenAwareSplitter = tokenAwareSplitter;
     }
 
     @Override
@@ -235,10 +241,11 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
 
             chunkBgeM3Mapper.deleteByDocId(documentId);
 
+            String filename = document.getFilename();
             if ("md".equalsIgnoreCase(filetype) || "markdown".equalsIgnoreCase(filetype)) {
-                processMarkdownDocument(document.getKbId(), documentId, filePath);
+                processMarkdownDocument(document.getKbId(), documentId, filename, filePath);
             } else {
-                processDocumentWithParser(document.getKbId(), documentId, filePath, filetype);
+                processDocumentWithParser(document.getKbId(), documentId, filename, filePath, filetype);
             }
         } catch (JsonProcessingException e) {
             throw new BizException("解析文档时序列化错误: " + e.getMessage());
@@ -248,7 +255,7 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
     /**
      * 使用 DocumentParserService 处理非 Markdown 文档
      */
-    private void processDocumentWithParser(String kbId, String documentId, String filePath, String filetype) {
+    private void processDocumentWithParser(String kbId, String documentId, String filename, String filePath, String filetype) {
         try {
             DocumentParserService parser = findParser(filetype);
             if (parser == null) {
@@ -266,8 +273,8 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
                     return;
                 }
 
-                saveChunks(kbId, documentId, sections);
-                log.info("文档处理完成: documentId={}, 共生成 {} 个 chunks", documentId, sections.size());
+                saveChunks(kbId, documentId, filename, sections);
+                log.info("文档处理完成: documentId={}, 共 {} 个 section", documentId, sections.size());
             }
         } catch (BizException e) {
             throw e;
@@ -290,58 +297,107 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
     }
 
     /**
-     * 保存 chunks 到数据库
+     * 将解析器输出的 sections 转成 {@link ParsedChunk}，交给
+     * {@link TokenAwareSplitter} 做二次切分后统一入库。
+     *
+     * <p>核心修复：</p>
+     * <ul>
+     *   <li>Embedding 使用最终入库的 {@code content} 生成，而不是 title</li>
+     *   <li>写入 filename / pageNumber / headingPath / chunkIndex / tokenCount 元数据</li>
+     *   <li>空正文的 chunk 跳过入库，仅记录 WARN 日志</li>
+     * </ul>
      */
-    private void saveChunks(String kbId, String documentId, List<DocumentParserService.DocumentSection> sections) {
+    private void saveChunks(String kbId, String documentId, String filename,
+                            List<DocumentParserService.DocumentSection> sections) {
         LocalDateTime now = LocalDateTime.now();
-        int chunkCount = 0;
 
-        for (int idx = 0; idx < sections.size(); idx++) {
-            DocumentParserService.DocumentSection section = sections.get(idx);
+        // 1) sections → ParsedChunk（优先使用解析器给出的 headingPath / pageNumber，
+        //    退化时回落到 "最新 title 覆盖" 策略）
+        List<ParsedChunk> parsed = new ArrayList<>(sections.size());
+        String fallbackHeading = null;
+        for (DocumentParserService.DocumentSection section : sections) {
             String title = section.getTitle();
             String content = section.getContent();
+            String headingPath = section.getHeadingPath();
+            Integer pageNumber = section.getPageNumber();
 
-            if (title == null || title.trim().isEmpty()) {
+            if (title != null && !title.isBlank()) {
+                fallbackHeading = title.trim();
+            }
+            if (content == null || content.isBlank()) {
                 continue;
             }
 
+            String effectiveHeading = (headingPath != null && !headingPath.isBlank())
+                    ? headingPath
+                    : fallbackHeading;
+
+            parsed.add(ParsedChunk.builder()
+                    .content(content)
+                    .headingPath(effectiveHeading)
+                    .pageNumber(pageNumber)
+                    .build());
+        }
+
+        if (parsed.isEmpty()) {
+            log.warn("文档没有可入库的正文: documentId={}", documentId);
+            return;
+        }
+
+        // 2) TokenAwareSplitter 二次切分
+        List<Chunk> finalChunks = tokenAwareSplitter.split(parsed);
+        if (finalChunks.isEmpty()) {
+            log.warn("Splitter 输出为空: documentId={}", documentId);
+            return;
+        }
+
+        int inserted = 0;
+        for (Chunk c : finalChunks) {
+            String content = c.getContent();
+            if (content == null || content.isBlank()) {
+                log.warn("跳过空正文 chunk: documentId={}, chunkIndex={}", documentId, c.getChunkIndex());
+                continue;
+            }
             try {
-                float[] embedding = ragService.embed(title);
+                // 3) 对最终 content 做 embedding（关键修复）
+                float[] embedding = ragService.embed(content);
 
                 ChunkBgeM3DTO.MetaData metaData = new ChunkBgeM3DTO.MetaData();
-                metaData.setTitle(title);
-                metaData.setHeadingLevel(section.getHeadingLevel() != null ? section.getHeadingLevel() : 1);
-                metaData.setSortOrder(idx);
+                metaData.setTitle(c.getHeadingPath());
+                metaData.setHeadingLevel(1);
+                metaData.setSortOrder(c.getChunkIndex());
                 String metadataJson = objectMapper.writeValueAsString(metaData);
 
                 ChunkBgeM3 chunk = ChunkBgeM3.builder()
                         .kbId(kbId)
                         .docId(documentId)
-                        .content(content != null ? content : "")
+                        .content(content)
                         .metadata(metadataJson)
                         .embedding(embedding)
+                        .filename(filename)
+                        .pageNumber(c.getPageNumber())
+                        .headingPath(c.getHeadingPath())
+                        .chunkIndex(c.getChunkIndex())
+                        .tokenCount(c.getTokenCount())
                         .createdAt(now)
                         .updatedAt(now)
                         .build();
 
                 int result = chunkBgeM3Mapper.insert(chunk);
                 if (result > 0) {
-                    chunkCount++;
-                    log.debug("创建 chunk 成功: title={}, chunkId={}", title, chunk.getId());
-                } else {
-                    log.warn("创建 chunk 失败: title={}", title);
+                    inserted++;
                 }
             } catch (Exception e) {
-                log.error("创建 chunk 失败: title={}", title, e);
+                log.error("创建 chunk 失败: documentId={}, chunkIndex={}", documentId, c.getChunkIndex(), e);
             }
         }
-        log.info("共生成 {} 个 chunks", chunkCount);
+        log.info("文档入库完成: documentId={}, 共生成 {} 个 chunk", documentId, inserted);
     }
 
     /**
      * 处理 Markdown 文档，解析并生成 chunks
      */
-    private void processMarkdownDocument(String kbId, String documentId, String filePath) {
+    private void processMarkdownDocument(String kbId, String documentId, String filename, String filePath) {
         try {
             log.info("开始处理 Markdown 文档: kbId={}, documentId={}, filePath={}", kbId, documentId, filePath);
 
@@ -356,17 +412,19 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
                     return;
                 }
 
-                // 转换为统一的 DocumentSection 格式
+                // 转换为统一的 DocumentSection 格式（保留 headingPath）
                 List<DocumentParserService.DocumentSection> documentSections = new ArrayList<>();
                 for (MarkdownParserService.MarkdownSection section : sections) {
                     documentSections.add(new DocumentParserService.DocumentSection(
                             section.getTitle(),
                             section.getContent(),
-                            section.getHeadingLevel()
+                            section.getHeadingLevel(),
+                            section.getHeadingPath(),
+                            null
                     ));
                 }
 
-                saveChunks(kbId, documentId, documentSections);
+                saveChunks(kbId, documentId, filename, documentSections);
                 log.info("Markdown 文档处理完成: documentId={}", documentId);
             }
         } catch (Exception e) {

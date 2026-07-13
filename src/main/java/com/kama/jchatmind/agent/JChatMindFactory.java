@@ -13,8 +13,10 @@ import com.kama.jchatmind.model.dto.ChatMessageDTO;
 import com.kama.jchatmind.model.dto.KnowledgeBaseDTO;
 import com.kama.jchatmind.model.entity.Agent;
 import com.kama.jchatmind.model.entity.KnowledgeBase;
+import com.kama.jchatmind.service.ChatMemoryCompressionService;
 import com.kama.jchatmind.service.ChatMessageFacadeService;
 import com.kama.jchatmind.service.RagService;
+import com.kama.jchatmind.service.RedisChatMemoryService;
 import com.kama.jchatmind.service.SseService;
 import com.kama.jchatmind.service.ToolFacadeService;
 import com.kama.jchatmind.service.UserChatClientService;
@@ -85,6 +87,12 @@ public class JChatMindFactory {
     /** RAG 服务，用于知识检索 */
     private final RagService ragService;
 
+    /** Redis 会话记忆管理服务 */
+    private final RedisChatMemoryService redisChatMemoryService;
+
+    /** 会话记忆压缩服务 */
+    private final ChatMemoryCompressionService chatMemoryCompressionService;
+
     /** 运行时 Agent 配置（在 create 方法中设置） */
     private AgentDTO agentConfig;
 
@@ -102,7 +110,9 @@ public class JChatMindFactory {
             ToolFacadeService toolFacadeService,
             ChatMessageFacadeService chatMessageFacadeService,
             ChatMessageConverter chatMessageConverter,
-            RagService ragService
+            RagService ragService,
+            RedisChatMemoryService redisChatMemoryService,
+            ChatMemoryCompressionService chatMemoryCompressionService
     ) {
         this.chatClientRegistry = chatClientRegistry;
         this.userChatClientService = userChatClientService;
@@ -115,6 +125,8 @@ public class JChatMindFactory {
         this.chatMessageFacadeService = chatMessageFacadeService;
         this.chatMessageConverter = chatMessageConverter;
         this.ragService = ragService;
+        this.redisChatMemoryService = redisChatMemoryService;
+        this.chatMemoryCompressionService = chatMemoryCompressionService;
     }
 
     /**
@@ -131,10 +143,11 @@ public class JChatMindFactory {
      * 将数据库中存储的历史对话记录恢复成 Spring AI 的 List<Message> 结构
      *
      * 工作流程：
-     * 1. 从 agentConfig 获取需要加载的消息数量
-     * 2. 查询数据库中最近的 N 条消息
-     * 3. 根据消息角色（SYSTEM/USER/ASSISTANT/TOOL）转换为对应的 Message 对象
-     * 4. SystemMessage 插入到列表开头，其他消息按顺序追加
+     * 1. 优先从 Redis 加载消息
+     * 2. 如果 Redis 没有数据，从数据库加载并写入 Redis
+     * 3. 加载压缩摘要作为上下文
+     * 4. 根据消息角色（SYSTEM/USER/ASSISTANT/TOOL）转换为对应的 Message 对象
+     * 5. SystemMessage 插入到列表开头，其他消息按顺序追加
      *
      * @param chatSessionId 聊天会话 ID
      * @return 恢复后的消息列表，用于初始化 Agent 的记忆
@@ -143,12 +156,35 @@ public class JChatMindFactory {
         Integer configLength = agentConfig.getChatOptions().getMessageLength();
         int messageLength = configLength != null ? configLength : 6;
 
-        List<ChatMessageDTO> chatMessages = chatMessageFacadeService.getChatMessagesBySessionIdRecently(chatSessionId, messageLength);
+        List<ChatMessageDTO> chatMessages;
+
+        // 1. 优先从 Redis 加载
+        if (redisChatMemoryService.hasSession(chatSessionId)) {
+            chatMessages = redisChatMemoryService.getRecentMessages(chatSessionId, messageLength);
+            log.info("Loaded {} messages from Redis for session: {}", chatMessages.size(), chatSessionId);
+        } else {
+            // 2. Redis 没有数据，从数据库加载
+            chatMessages = chatMessageFacadeService.getChatMessagesBySessionIdRecently(chatSessionId, messageLength);
+            log.info("Loaded {} messages from database for session: {}", chatMessages.size(), chatSessionId);
+
+            // 3. 写入 Redis 缓存
+            if (!chatMessages.isEmpty()) {
+                redisChatMemoryService.addMessages(chatSessionId, chatMessages);
+                log.info("Cached {} messages to Redis for session: {}", chatMessages.size(), chatSessionId);
+            }
+        }
 
         // 存储转换后的 Spring AI Message 对象
         List<Message> memory = new ArrayList<>();
 
-        // 遍历每条消息，根据角色类型进行转换
+        // 4. 加载压缩摘要作为上下文
+        String summary = chatMemoryCompressionService.getLatestSummary(chatSessionId);
+        if (summary != null && !summary.isEmpty()) {
+            memory.add(new SystemMessage("【历史对话摘要】\n" + summary));
+            log.info("Loaded compression summary for session: {}", chatSessionId);
+        }
+
+        // 5. 遍历每条消息，根据角色类型进行转换
         for (ChatMessageDTO chatMessageDTO : chatMessages) {
             switch (chatMessageDTO.getRole()) {
                 case SYSTEM:
@@ -398,7 +434,9 @@ public class JChatMindFactory {
                 sseService,
                 chatMessageFacadeService,
                 chatMessageConverter,
-                ragService
+                ragService,
+                redisChatMemoryService,
+                chatMemoryCompressionService
         );
     }
 

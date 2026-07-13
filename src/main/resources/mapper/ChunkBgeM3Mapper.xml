@@ -11,14 +11,20 @@
         <result property="content" column="content" jdbcType="VARCHAR"/>
         <result property="metadata" column="metadata" jdbcType="VARCHAR"/>
         <result property="embedding" column="embedding" jdbcType="OTHER"/>
+        <result property="filename" column="filename" jdbcType="VARCHAR"/>
+        <result property="pageNumber" column="page_number" jdbcType="INTEGER"/>
+        <result property="headingPath" column="heading_path" jdbcType="VARCHAR"/>
+        <result property="chunkIndex" column="chunk_index" jdbcType="INTEGER"/>
+        <result property="tokenCount" column="token_count" jdbcType="INTEGER"/>
         <result property="createdAt" column="created_at" jdbcType="TIMESTAMP"/>
         <result property="updatedAt" column="updated_at" jdbcType="TIMESTAMP"/>
     </resultMap>
 
     <sql id="Base_Column_List">
-        id,kb_id,doc_id,
-        content,metadata,embedding,
-        created_at,updated_at
+        id, kb_id, doc_id,
+        content, metadata, embedding,
+        filename, page_number, heading_path, chunk_index, token_count,
+        created_at, updated_at
     </sql>
 
     <insert id="insert" parameterType="com.kama.jchatmind.model.entity.ChunkBgeM3"
@@ -29,6 +35,11 @@
          content,
          metadata,
          embedding,
+         filename,
+         page_number,
+         heading_path,
+         chunk_index,
+         token_count,
          created_at,
          updated_at)
         VALUES (CAST(#{kbId} AS uuid),
@@ -36,19 +47,17 @@
                 #{content},
                 #{metadata}::jsonb,
                 #{embedding}::vector,
+                #{filename},
+                #{pageNumber},
+                #{headingPath},
+                #{chunkIndex},
+                #{tokenCount},
                 #{createdAt},
                 #{updatedAt})
     </insert>
 
     <select id="selectById" resultMap="BaseResultMap">
-        SELECT id,
-               kb_id,
-               doc_id,
-               content,
-               metadata,
-               embedding,
-               created_at,
-               updated_at
+        SELECT <include refid="Base_Column_List"/>
         FROM chunk_bge_m3
         WHERE id = CAST(#{id} AS uuid)
     </select>
@@ -77,11 +86,31 @@
             <if test="embedding != null">
                 embedding = #{embedding}::vector,
             </if>
+            <if test="filename != null">
+                filename = #{filename},
+            </if>
+            <if test="pageNumber != null">
+                page_number = #{pageNumber},
+            </if>
+            <if test="headingPath != null">
+                heading_path = #{headingPath},
+            </if>
+            <if test="chunkIndex != null">
+                chunk_index = #{chunkIndex},
+            </if>
+            <if test="tokenCount != null">
+                token_count = #{tokenCount},
+            </if>
             updated_at = NOW()
         </set>
         WHERE id = CAST(#{id} AS uuid)
     </update>
 
+    <!--
+        向量召回：使用 cosine 距离算子 <=>（bge-m3 官方推荐）。
+        distance ∈ [0, 2]，similarity = 1 - distance ∈ [-1, 1]，
+        对归一化向量而言约等于 cosine similarity。
+    -->
     <select id="similaritySearch" resultMap="BaseResultMap">
         <![CDATA[
         SELECT id,
@@ -90,31 +119,76 @@
                content,
                metadata,
                embedding,
+               filename,
+               page_number,
+               heading_path,
+               chunk_index,
+               token_count,
                created_at,
                updated_at
         FROM chunk_bge_m3
         WHERE kb_id = CAST(#{kbId} AS uuid)
-        ORDER BY embedding <-> #{vectorLiteral}::vector
+        ORDER BY embedding <=> #{vectorLiteral}::vector
         LIMIT #{limit}
         ]]>
     </select>
 
-    <select id="selectByDocId" resultMap="BaseResultMap">
+    <!--
+        BM25 关键词召回：使用 tsvector 生成列 + GIN 索引。
+        当前 tokenizer = 'simple'（覆盖英文/代码/专有名词），中文分词见后续变更。
+    -->
+    <select id="bm25Search" resultMap="BaseResultMap">
+        <![CDATA[
         SELECT id,
                kb_id,
                doc_id,
                content,
                metadata,
                embedding,
+               filename,
+               page_number,
+               heading_path,
+               chunk_index,
+               token_count,
                created_at,
                updated_at
         FROM chunk_bge_m3
+        WHERE kb_id = CAST(#{kbId} AS uuid)
+          AND content_tsv @@ plainto_tsquery('simple', #{query})
+        ORDER BY ts_rank_cd(content_tsv, plainto_tsquery('simple', #{query})) DESC
+        LIMIT #{limit}
+        ]]>
+    </select>
+
+    <select id="selectByDocId" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM chunk_bge_m3
         WHERE doc_id = CAST(#{docId} AS uuid)
-        ORDER BY created_at ASC
+        ORDER BY chunk_index ASC NULLS LAST, created_at ASC
     </select>
 
     <delete id="deleteByDocId">
         DELETE FROM chunk_bge_m3
         WHERE doc_id = CAST(#{docId} AS uuid)
     </delete>
+
+    <!--
+        分页扫描：按 id 升序，从 lastId 之后开始。lastId 为空则从头开始。
+        UUID 类型使用字符串比较；生产表 PK 是 uuid，用 CAST 保证类型安全。
+    -->
+    <select id="selectPageAfter" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM chunk_bge_m3
+        <where>
+            <if test="lastId != null and lastId != ''">
+                id &gt; CAST(#{lastId} AS uuid)
+            </if>
+        </where>
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="countAll" resultType="long">
+        SELECT COUNT(*) FROM chunk_bge_m3
+    </select>
 </mapper>

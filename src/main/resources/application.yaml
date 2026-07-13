@@ -1,0 +1,122 @@
+spring:
+  application:
+    name: jchatmind
+
+  # 本地开发时从 application-local.yaml 叠加真实密钥；
+  # 该文件已在 .gitignore 中，且带 optional: 前缀，缺失也不会报错。
+  # 生产环境请通过环境变量注入（DEEPSEEK_API_KEY / ZHIPUAI_API_KEY / DASHSCOPE_API_KEY / DB_PASSWORD / MAIL_USERNAME / MAIL_AUTH_CODE）。
+  config:
+    import: optional:classpath:application-local.yaml
+
+  mvc:
+    async:
+      request-timeout: 1800000
+  datasource:
+    url: jdbc:postgresql://localhost:5432/jchatmind
+    username: PC
+    password: ${DB_PASSWORD:}
+    driver-class-name: org.postgresql.Driver
+
+  # Flyway：应用启动时自动执行 src/main/resources/db/migration/V*.sql
+  #   - baseline-on-migrate=true 表示旧库首次接入不报错，直接从 V2 开始跑
+  #   - baseline-version=1 表示把当前状态视为 V1 基线
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    baseline-version: 1
+    baseline-description: "Initial baseline (pre-Flyway schema)"
+    validate-on-migrate: false
+
+  mail:
+    host: smtp.qq.com
+    port: 587
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_AUTH_CODE:}      # 邮箱授权码
+    default-encoding: UTF-8
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+  ai:
+    deepseek:
+      api-key: ${DEEPSEEK_API_KEY:}
+      base-url: https://api.deepseek.com
+      chat:
+        options:
+          model: deepseek-chat
+    zhipuai:
+      api-key: ${ZHIPUAI_API_KEY:}
+      base-url: https://open.bigmodel.cn/api/paas
+      chat:
+        options:
+          model: glm-4.6
+    openai:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode
+      api-key: ${DASHSCOPE_API_KEY:}
+      chat:
+        options:
+          model: qwen-plus
+  data:
+    redis:
+      database: 2
+      host: localhost
+      port: 6379
+mybatis:
+  type-aliases-package: com.kama.jchatmind.model.entity
+  mapper-locations: classpath:mapper/*.xml
+  type-handlers-package: com.kama.jchatmind.typehandler
+
+document:
+  storage:
+    base-path: ./data/documents
+
+# =============================================================================
+# JChatMind RAG 配置（见 config/RagProperties.java）
+# =============================================================================
+jchatmind:
+  rag:
+    # 切分策略：结构化解析结果之上，按 token 二次切分
+    chunk:
+      max-tokens: 512        # 单 chunk 最大 token 数
+      min-tokens: 64         # 单 chunk 最小 token 数（低于此值合并）
+      overlap: 64            # 相邻子 chunk 的 overlap token 数
+    similarity:
+      threshold: 0.35        # cosine 相似度阈值
+    hybrid:
+      enabled: true          # 是否启用向量+BM25+RRF 融合（V2 迁移后开启）
+      vector-top-n: 20
+      bm25-top-n: 20
+      final-top-n: 20
+      rrf-k: 60
+    rerank:
+      enabled: true                                # 是否启用重排
+      provider: dashscope                          # ollama（本地 bge-reranker-v2-m3）或 dashscope（阿里云 gte-rerank）
+      model: gte-rerank-v2                         # ollama 用 bge-reranker-v2-m3，dashscope 用 gte-rerank-v2 / gte-rerank-hybrid
+      base-url: https://dashscope.aliyuncs.com     # ollama 时改回 http://localhost:11434
+      api-key: ${DASHSCOPE_API_KEY:}               # dashscope 时必填；ollama 时可留空
+      timeout-ms: 5000
+      top-k: 5
+    read:
+      mode: both             # new / legacy / both（迁移期建议 both）
+    legacy-mode: false        # 兼容旧标题嵌入行为（不建议开启）
+
+# 日志配置
+logging:
+#  level:
+#    root: INFO
+#    com.kama.jchatmind: DEBUG
+#    org.springframework: INFO
+#  pattern:
+#    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+#    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+#  file:
+#    name: logs/jchatmind.log
+#    max-size: 10MB
+#    max-history: 30
+  charset:
+    console: UTF-8
+    #file: UTF-8

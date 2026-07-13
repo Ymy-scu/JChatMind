@@ -55,6 +55,11 @@ public class WordParserServiceImpl implements DocumentParserService {
         StringBuilder currentTitle = new StringBuilder();
         StringBuilder currentContent = new StringBuilder();
         int currentLevel = 1;
+        String currentHeadingPath = null;
+
+        // 维护 heading 面包屑（level → title），弹出所有 level ≥ 当前 level 的祖先
+        java.util.Deque<int[]> levelStack = new java.util.ArrayDeque<>();
+        java.util.Deque<String> titleStack = new java.util.ArrayDeque<>();
 
         for (IBodyElement element : document.getBodyElements()) {
             if (element instanceof XWPFParagraph paragraph) {
@@ -71,9 +76,20 @@ public class WordParserServiceImpl implements DocumentParserService {
                         sections.add(new DocumentSection(
                                 currentTitle.toString().trim(),
                                 currentContent.toString().trim(),
-                                currentLevel
+                                currentLevel,
+                                currentHeadingPath,
+                                null
                         ));
                     }
+
+                    // 更新面包屑
+                    while (!levelStack.isEmpty() && levelStack.peek()[0] >= headingLevel) {
+                        levelStack.pop();
+                        titleStack.pop();
+                    }
+                    levelStack.push(new int[]{headingLevel});
+                    titleStack.push(text.trim());
+                    currentHeadingPath = buildHeadingPath(titleStack);
 
                     currentTitle = new StringBuilder(text);
                     currentContent = new StringBuilder();
@@ -99,7 +115,9 @@ public class WordParserServiceImpl implements DocumentParserService {
             sections.add(new DocumentSection(
                     currentTitle.toString().trim(),
                     currentContent.toString().trim(),
-                    currentLevel
+                    currentLevel,
+                    currentHeadingPath,
+                    null
             ));
         }
 
@@ -120,6 +138,10 @@ public class WordParserServiceImpl implements DocumentParserService {
         StringBuilder currentTitle = new StringBuilder();
         StringBuilder currentContent = new StringBuilder();
         int currentLevel = 1;
+        String currentHeadingPath = null;
+
+        java.util.Deque<int[]> levelStack = new java.util.ArrayDeque<>();
+        java.util.Deque<String> titleStack = new java.util.ArrayDeque<>();
 
         for (String paragraph : paragraphs) {
             String trimmed = paragraph.trim();
@@ -134,9 +156,19 @@ public class WordParserServiceImpl implements DocumentParserService {
                     sections.add(new DocumentSection(
                             currentTitle.toString().trim(),
                             currentContent.toString().trim(),
-                            currentLevel
+                            currentLevel,
+                            currentHeadingPath,
+                            null
                     ));
                 }
+
+                while (!levelStack.isEmpty() && levelStack.peek()[0] >= headingLevel) {
+                    levelStack.pop();
+                    titleStack.pop();
+                }
+                levelStack.push(new int[]{headingLevel});
+                titleStack.push(trimmed);
+                currentHeadingPath = buildHeadingPath(titleStack);
 
                 currentTitle = new StringBuilder(trimmed);
                 currentContent = new StringBuilder();
@@ -153,7 +185,9 @@ public class WordParserServiceImpl implements DocumentParserService {
             sections.add(new DocumentSection(
                     currentTitle.toString().trim(),
                     currentContent.toString().trim(),
-                    currentLevel
+                    currentLevel,
+                    currentHeadingPath,
+                    null
             ));
         }
 
@@ -162,6 +196,14 @@ public class WordParserServiceImpl implements DocumentParserService {
 
         log.info("Word (doc) 解析完成，共提取 {} 个章节", sections.size());
         return sections;
+    }
+
+    /** 把 titleStack（栈顶为最新 heading）按栈底 → 栈顶顺序拼成 {@code "父 / 子 / 孙"} */
+    private String buildHeadingPath(java.util.Deque<String> titleStack) {
+        if (titleStack.isEmpty()) return null;
+        List<String> ordered = new ArrayList<>(titleStack);
+        java.util.Collections.reverse(ordered);
+        return String.join(" / ", ordered);
     }
 
     private int detectHeadingLevel(String text, String styleName) {

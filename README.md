@@ -60,3 +60,125 @@ JChatMind 采用现代化高可用分布式架构，具备极强的扩展性、�
 - 业务流程自动化（RPA + AI 融合）
 
 ---
+
+## RAG 检索增强（Retrieval Augmented Generation）
+
+JChatMind 内置一套面向企业私有知识库的 RAG 主链路，遵循"80% 收益来自 20% 功能"的取舍，聚焦 6 项核心能力：正确的 embedding、正确的距离度量、Token 感知切分、Hybrid 融合、Reranker 二次排序、引用溯源。
+
+### 架构一览
+
+```
+用户提问
+   │
+   ▼
+┌─────────────────────────────────────────────────────────┐
+│ Agent (JChatMind)                                       │
+│   ensureKnowledgeContext(query)                         │
+│      └─► RagService.retrieve(kbId, query)               │
+└─────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────── read.mode 分发 ────────────────┐
+│  new       │ hybrid → 阈值 → rerank → Top-K     │
+│  legacy    │ 仅向量召回 Top-N                    │
+│  both      │ new 优先，legacy 去重补齐           │
+└─────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────┐
+│ Hybrid 召回（并行 CompletableFuture）                    │
+│   ├─ 向量召回：bge-m3 embedding + pgvector cosine (HNSW) │
+│   └─ BM25 召回：content_tsv (tsvector + GIN)             │
+│                    ↓                                     │
+│           Reciprocal Rank Fusion (k=60)                  │
+└─────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────┐
+│ Rerank：bge-reranker-v2-m3 (Ollama /api/rerank)         │
+│   超时/失败自动降级为原顺序                              │
+└─────────────────────────────────────────────────────────┘
+           │
+           ▼
+       RetrievedChunk[]（含 filename / headingPath / pageNumber / chunkIndex）
+           │
+           ├─► System Message 注入 LLM
+           └─► SSE `AI_REFERENCES` 事件 + chat_message.references JSONB 持久化
+```
+
+### 关键技术选型
+
+| 环节 | 组件 | 说明 |
+|------|------|------|
+| Embedding | `bge-m3` | Ollama 本地部署，1024 维 |
+| 向量存储 | `pgvector` | HNSW + `vector_cosine_ops` |
+| 关键词 | PostgreSQL `tsvector` | GIN 索引，`plainto_tsquery('simple', ...)` |
+| 融合 | RRF | `score = Σ 1 / (k + rank)`，`k = 60` |
+| Reranker | `bge-reranker-v2-m3` / `gte-rerank-v2` | 双 provider：本地 Ollama 或阿里云 DashScope，超时 3~5s，失败降级 |
+| 切分 | `TokenAwareSplitter` | 句子边界优先 + 短片段合并 + overlap |
+| 元数据 | `filename / heading_path / page_number / chunk_index / token_count` | 支撑引用溯源 |
+
+### 配置示例
+
+`application.yaml`：
+
+```yaml
+jchatmind:
+  rag:
+    chunk:
+      max-tokens: 512
+      min-tokens: 64
+      overlap: 64
+    similarity:
+      threshold: 0.35        # cosine similarity 阈值
+    hybrid:
+      enabled: true          # 关闭则退化为纯向量
+      vector-top-n: 20
+      bm25-top-n: 20
+      final-top-n: 20
+      rrf-k: 60
+    rerank:
+      enabled: true
+      provider: dashscope           # ollama（本地）或 dashscope（阿里云百炼）
+      model: gte-rerank-v2          # ollama 用 bge-reranker-v2-m3
+      base-url: https://dashscope.aliyuncs.com   # ollama 换回 http://localhost:11434
+      api-key: sk-xxxx              # 仅 dashscope 需要
+      timeout-ms: 5000
+      top-k: 5
+    read:
+      mode: new              # new | legacy | both（灰度迁移用）
+```
+
+Feature Flag 灰度：先 `both` → 观察 → 切 `new` → 删除 legacy 索引与代码。
+
+### 引用溯源
+
+每一次 AI 回答的 SSE 流末尾都会推送一个 `AI_REFERENCES` 事件，前端据此渲染"参考资料"卡片：
+
+- `filename`：源文件名（`jmm-basics.md` 等）
+- `headingPath`：面包屑，形如 `第一章 Java 内存模型 / 1.2 volatile 语义`
+- `pageNumber`：PDF 场景下的起始页码
+- `chunkIndex` + `documentId`：便于前端跳转与去重
+- `content`：截取 200 字符预览
+
+同一份数据会以 JSONB 形式写入 `chat_message.references`，方便回溯与审计。
+
+### 相关文档
+
+- 迁移手册：[`data/rag-migration-runbook.md`](./data/rag-migration-runbook.md)
+- 手工验证脚本：[`data/verify-rag.md`](./data/verify-rag.md)
+- 变更提案：[`openspec/changes/improve-rag-core-quality/`](./openspec/changes/improve-rag-core-quality/)
+
+### 一次性回填（老库升级）
+
+`embed(title)` → `embed(content)` 修复后需回填历史 embedding，以及 `filename / heading_path / page_number / chunk_index / token_count` 元数据：
+
+```bash
+# 后台跑，默认 5 qps，可通过 rag.rebuild.rate 调整
+mvn spring-boot:run -Dspring-boot.run.profiles=rebuild-embeddings \
+  -Dspring-boot.run.arguments="--rag.rebuild.rate=5 --rag.rebuild.page-size=200"
+```
+
+支持断点续跑：进度记录在 `data/rag-rebuild-progress.txt`，Ctrl+C 中断后再次启动会从上次的 `id` 继续。
+
+---

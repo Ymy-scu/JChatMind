@@ -1,6 +1,7 @@
 package com.kama.jchatmind.config;
 
 import com.kama.jchatmind.advisor.QueryExpansionAdvisor;
+import com.kama.jchatmind.advisor.QueryRewriteAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.deepseek.DeepSeekChatModel;
@@ -15,21 +16,30 @@ public class MultiChatClientConfig {
     @Bean("deepseek-chat")
     public ChatClient deepSeekChatClient(DeepSeekChatModel deepSeekChatModel) {
         return ChatClient.builder(deepSeekChatModel)
-                .defaultAdvisors(new QueryExpansionAdvisor(deepSeekChatModel))
+                .defaultAdvisors(
+                        new QueryRewriteAdvisor(deepSeekChatModel, -1),
+                        new QueryExpansionAdvisor(deepSeekChatModel, 0)
+                )
                 .build();
     }
 
     @Bean("glm-4.7-flash")
     public ChatClient zhiPuAiChatClient(ZhiPuAiChatModel zhiPuAiChatModel) {
         return ChatClient.builder(zhiPuAiChatModel)
-                .defaultAdvisors(new QueryExpansionAdvisor(zhiPuAiChatModel))
+                .defaultAdvisors(
+                        new QueryRewriteAdvisor(zhiPuAiChatModel, -1),
+                        new QueryExpansionAdvisor(zhiPuAiChatModel, 0)
+                )
                 .build();
     }
 
     @Bean("qwen-plus")
     public ChatClient openAiChatClient(OpenAiChatModel openAiChatModel) {
         return ChatClient.builder(openAiChatModel)
-                .defaultAdvisors(new QueryExpansionAdvisor(openAiChatModel))
+                .defaultAdvisors(
+                        new QueryRewriteAdvisor(openAiChatModel, -1),
+                        new QueryExpansionAdvisor(openAiChatModel, 0)
+                )
                 .build();
     }
 }

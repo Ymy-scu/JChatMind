@@ -7,8 +7,15 @@ import {
   RobotOutlined,
   DownOutlined,
   RightOutlined,
+  FileTextOutlined,
 } from "@ant-design/icons";
-import type { ChatMessageVO, SseMessageType, ToolCall, ToolResponse } from "../../../types";
+import type {
+  ChatMessageVO,
+  RetrievedChunk,
+  SseMessageType,
+  ToolCall,
+  ToolResponse,
+} from "../../../types";
 
 interface AgentChatHistoryProps {
   messages: ChatMessageVO[];
@@ -40,6 +47,74 @@ const ToolCallDisplay: React.FC<{ toolCall: ToolCall }> = ({ toolCall }) => {
           <span className="text-gray-400">·</span>
           <span className="text-gray-500 truncate max-w-[200px]">{argPreview}</span>
         </>
+      )}
+    </div>
+  );
+};
+
+/**
+ * 参考资料卡片：折叠面板，展示本轮 AI 回答依据的知识库片段。
+ *
+ * <p>数据来自 SSE {@code AI_REFERENCES} 事件，每条含 {@code filename}
+ * / {@code headingPath} / {@code pageNumber} / {@code content} 预览。</p>
+ */
+const ReferencesDisplay: React.FC<{ references: RetrievedChunk[] }> = ({
+  references,
+}) => {
+  const [expanded, setExpanded] = useState(false);
+  if (!references || references.length === 0) return null;
+
+  const buildLocation = (ref: RetrievedChunk): string => {
+    const parts: string[] = [];
+    if (ref.filename) parts.push(ref.filename);
+    if (ref.headingPath) parts.push(ref.headingPath);
+    if (ref.pageNumber != null) parts.push(`p.${ref.pageNumber}`);
+    return parts.join(" · ") || "未命名片段";
+  };
+
+  return (
+    <div className="mt-2 text-xs">
+      <div
+        className="flex items-center gap-2 text-gray-500 cursor-pointer hover:text-gray-700 transition-colors select-none"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {expanded ? (
+          <DownOutlined className="text-gray-400" />
+        ) : (
+          <RightOutlined className="text-gray-400" />
+        )}
+        <FileTextOutlined className="text-indigo-500" />
+        <span className="font-medium text-indigo-600">参考资料</span>
+        <span className="text-gray-400">·</span>
+        <span className="text-gray-500">{references.length} 条</span>
+      </div>
+      {expanded && (
+        <ul className="ml-5 mt-1.5 space-y-1.5">
+          {references.map((ref, i) => (
+            <li
+              key={ref.id ?? `${ref.documentId ?? "-"}-${ref.chunkIndex ?? i}`}
+              className="p-2 bg-gray-50 rounded border border-gray-200"
+            >
+              <div className="flex items-center gap-1.5 text-gray-600">
+                <span className="text-gray-400">#{i + 1}</span>
+                <span className="font-mono text-indigo-700 truncate">
+                  {buildLocation(ref)}
+                </span>
+                {ref.score != null && (
+                  <>
+                    <span className="text-gray-400">·</span>
+                    <span className="text-gray-400">
+                      score={ref.score.toFixed(3)}
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="mt-1 text-gray-600 whitespace-pre-wrap break-words">
+                {ref.content}
+              </div>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
@@ -227,6 +302,13 @@ const AgentChatHistory: React.FC<AgentChatHistoryProps> = ({
                         </XMarkdown>
                       </div>
                     )}
+                    {/* 参考资料（RAG 引用溯源） */}
+                    {message.metadata?.references &&
+                      message.metadata.references.length > 0 && (
+                        <ReferencesDisplay
+                          references={message.metadata.references}
+                        />
+                      )}
                   </div>
                 }
                 placement="start"

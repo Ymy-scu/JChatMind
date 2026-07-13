@@ -51,8 +51,11 @@ public class MarkdownParserServiceImpl implements MarkdownParserService {
     }
 
     /**
-     * 提取标题和内容
-     * 只遍历文档的直接子节点，遇到任何标题就停止收集当前标题的内容
+     * 提取标题和内容。
+     *
+     * <p>额外维护一个"heading 栈"以生成 {@code headingPath} 面包屑：
+     * 遇到新 heading 时，把栈中所有 level ≥ 当前 level 的祖先弹出，
+     * 再压入当前 title。栈中元素用 {@code " / "} 拼接即得到面包屑。</p>
      */
     private void extractSections(Document document, List<MarkdownSection> sections) {
         // 收集文档的所有直接子节点（顶层节点）
@@ -62,29 +65,44 @@ public class MarkdownParserServiceImpl implements MarkdownParserService {
             topLevelNodes.add(child);
             child = child.getNext();
         }
-        
+
+        // headingStack: 从根到当前的 heading 链，每个元素为 [level, title]
+        java.util.Deque<int[]> levelStack = new java.util.ArrayDeque<>();
+        java.util.Deque<String> titleStack = new java.util.ArrayDeque<>();
+
         // 遍历顶层节点，找到所有标题
         for (int i = 0; i < topLevelNodes.size(); i++) {
             Node node = topLevelNodes.get(i);
-            
+
             if (node instanceof Heading) {
                 Heading heading = (Heading) node;
                 String title = extractHeadingText(heading);
-                
+
                 if (title == null || title.trim().isEmpty()) {
                     continue;
                 }
-                
+
                 int headingLevel = heading.getLevel();
-                
+
+                // 弹出所有 level >= 当前 level 的祖先，保证栈是严格递增的
+                while (!levelStack.isEmpty() && levelStack.peek()[0] >= headingLevel) {
+                    levelStack.pop();
+                    titleStack.pop();
+                }
+                levelStack.push(new int[]{headingLevel});
+                titleStack.push(title);
+
+                // 面包屑：从栈底到栈顶
+                String headingPath = buildHeadingPath(titleStack);
+
                 StringBuilder contentBuilder = new StringBuilder();
                 for (int j = i + 1; j < topLevelNodes.size(); j++) {
                     Node nextNode = topLevelNodes.get(j);
-                    
+
                     if (nextNode instanceof Heading) {
                         break;
                     }
-                    
+
                     String content = extractNodeContent(nextNode);
                     if (content != null && !content.trim().isEmpty()) {
                         if (contentBuilder.length() > 0) {
@@ -93,11 +111,19 @@ public class MarkdownParserServiceImpl implements MarkdownParserService {
                         contentBuilder.append(content);
                     }
                 }
-                
+
                 String content = contentBuilder.toString().trim();
-                sections.add(new MarkdownSection(title, content, headingLevel));
+                sections.add(new MarkdownSection(title, content, headingLevel, headingPath));
             }
         }
+    }
+
+    /** 把 titleStack（栈顶为最新 heading）按栈底 → 栈顶顺序拼成 {@code "父 / 子 / 孙"} */
+    private String buildHeadingPath(java.util.Deque<String> titleStack) {
+        if (titleStack.isEmpty()) return null;
+        List<String> ordered = new ArrayList<>(titleStack);
+        java.util.Collections.reverse(ordered);
+        return String.join(" / ", ordered);
     }
 
     /**

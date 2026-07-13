@@ -8,6 +8,8 @@ import org.springframework.ai.chat.client.advisor.api.AdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.BaseAdvisor;
 import org.springframework.ai.chat.client.advisor.api.CallAdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.StreamAdvisorChain;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -21,6 +23,7 @@ import java.util.stream.Collectors;
 /**
  * 查询扩写 Advisor
  * 在用户提问时自动进行查询扩写，将扩写后的查询添加到 system prompt 中
+ * 输入：查询重写后的用户消息（由 QueryRewriteAdvisor 处理）
  */
 @Slf4j
 public class QueryExpansionAdvisor implements BaseAdvisor {
@@ -39,20 +42,25 @@ public class QueryExpansionAdvisor implements BaseAdvisor {
 
     @Override
     public ChatClientRequest before(ChatClientRequest request, AdvisorChain advisorChain) {
-        // 获取用户消息
+        // 获取用户消息（此时应该是 QueryRewriteAdvisor 处理后的结果）
         Prompt prompt = request.prompt();
-        String userMessage = prompt.getInstructions().stream()
-                .filter(m -> m instanceof UserMessage)
-                .map(m -> m.getText())
-                .findFirst()
-                .orElse(null);
+        List<Message> messages = prompt.getInstructions();
+
+        // 获取最后一条用户消息
+        String userMessage = null;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (messages.get(i) instanceof UserMessage) {
+                userMessage = messages.get(i).getText();
+                break;
+            }
+        }
 
         if (userMessage == null || userMessage.trim().isEmpty()) {
             return request;
         }
 
         try {
-            // 进行查询扩写
+            // 基于重写后的查询进行扩写
             List<String> expandedQueries = expandQuery(userMessage);
 
             if (expandedQueries.size() <= 1) {
@@ -66,14 +74,22 @@ public class QueryExpansionAdvisor implements BaseAdvisor {
 
             String expansionHint = """
                     
-                    [系统提示] 用户的原始问题已扩展为以下相关查询，用于更全面地理解用户意图：
+                    [系统提示] 用户的问题已扩展为以下相关查询，用于更全面地理解用户意图：
                     %s
                     请综合考虑这些查询来回答用户的问题。
                     """.formatted(expandedText);
 
-            log.info("查询扩写: 原始='{}', 扩写数量={}", userMessage, expandedQueries.size() - 1);
+            log.info("查询扩写: 输入='{}', 扩写数量={}", userMessage, expandedQueries.size() - 1);
 
-            return request;
+            // 将扩写结果添加到消息列表中
+            List<Message> newMessages = new ArrayList<>(messages);
+            newMessages.add(new SystemMessage(expansionHint));
+
+            Prompt newPrompt = new Prompt(newMessages);
+            return ChatClientRequest.builder()
+                    .prompt(newPrompt)
+                    .context(request.context())
+                    .build();
 
         } catch (Exception e) {
             log.warn("查询扩写失败，使用原始查询: {}", e.getMessage());
@@ -125,7 +141,7 @@ public class QueryExpansionAdvisor implements BaseAdvisor {
                 }
             }
 
-            log.info("查询扩写结果: 原始='{}', 扩写={}", originalQuery, expandedQueries);
+            log.info("查询扩写结果: 输入='{}', 扩写={}", originalQuery, expandedQueries);
             return expandedQueries;
 
         } catch (Exception e) {

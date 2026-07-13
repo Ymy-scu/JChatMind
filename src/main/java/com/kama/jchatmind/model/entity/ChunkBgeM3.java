@@ -3,14 +3,18 @@ package com.kama.jchatmind.model.entity;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 /**
  * @TableName chunk_bge_m3
  */
 @Data
 @Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class ChunkBgeM3 {
     private String id;
 
@@ -23,6 +27,21 @@ public class ChunkBgeM3 {
     private String metadata;
 
     private float[] embedding;
+
+    /** 源文件名（冗余，便于展示与引用溯源） */
+    private String filename;
+
+    /** 页码（PDF 有值，Markdown/Word 可为 null） */
+    private Integer pageNumber;
+
+    /** heading 面包屑，形如 "第一章 / 1.2 权限" */
+    private String headingPath;
+
+    /** 同一 docId 下的顺序号，从 0 开始 */
+    private Integer chunkIndex;
+
+    /** 估算的 token 数 */
+    private Integer tokenCount;
 
     private LocalDateTime createdAt;
 
@@ -75,6 +94,11 @@ public class ChunkBgeM3 {
                 ", docId=" + docId +
                 ", content=" + content +
                 ", metadata=" + metadata +
+                ", filename=" + filename +
+                ", pageNumber=" + pageNumber +
+                ", headingPath=" + headingPath +
+                ", chunkIndex=" + chunkIndex +
+                ", tokenCount=" + tokenCount +
                 ", embedding=" + Arrays.toString(embedding) +
                 ", createdAt=" + createdAt +
                 ", updatedAt=" + updatedAt +

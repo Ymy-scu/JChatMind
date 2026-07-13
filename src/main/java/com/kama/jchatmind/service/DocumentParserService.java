@@ -2,6 +2,7 @@ package com.kama.jchatmind.service;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 import lombok.ToString;
 
 import java.io.InputStream;
@@ -32,13 +33,32 @@ public interface DocumentParserService {
 
     /**
      * 文档章节数据类
+     *
+     * <p>字段说明：</p>
+     * <ul>
+     *   <li>{@code title} —— 章节标题（原文）</li>
+     *   <li>{@code content} —— 章节正文</li>
+     *   <li>{@code headingLevel} —— 章节层级（1 表示 H1）</li>
+     *   <li>{@code headingPath} —— 面包屑，形如 {@code "第一章 / 1.2 权限"}，用于向 LLM 传递位置信息（可为空）</li>
+     *   <li>{@code pageNumber} —— 章节起始页码（PDF 专用，其它解析器为空）</li>
+     * </ul>
      */
     @Data
     @AllArgsConstructor
+    @NoArgsConstructor
     @ToString
     class DocumentSection {
         private String title;
         private String content;
         private Integer headingLevel;
+        /** 章节面包屑，格式 {@code "父级 / 子级"} */
+        private String headingPath;
+        /** PDF 章节起始页码；非 PDF 场景为空 */
+        private Integer pageNumber;
+
+        /** 兼容旧签名的三参构造：headingPath / pageNumber 置空 */
+        public DocumentSection(String title, String content, Integer headingLevel) {
+            this(title, content, headingLevel, null, null);
+        }
     }
 }

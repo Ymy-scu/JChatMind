@@ -41,25 +41,21 @@ public class PdfParserServiceImpl implements DocumentParserService {
             PDFTextStripper stripper = new PDFTextStripper();
             stripper.setSortByPosition(true);
 
+            // 逐页 parse，携带 pageNumber
             Map<Integer, String> pageContents = new LinkedHashMap<>();
-            Map<Integer, List<String[]>> pageTables = new LinkedHashMap<>();
-
             for (int i = 0; i < document.getNumberOfPages(); i++) {
                 stripper.setStartPage(i + 1);
                 stripper.setEndPage(i + 1);
                 String pageText = stripper.getText(document);
-
                 pageText = filterHeaderFooter(pageText, document, i);
-
-                pageContents.put(i, pageText);
+                pageContents.put(i + 1, pageText);
             }
 
-            String fullText = String.join("\n\n", pageContents.values());
-
-            sections = parseSections(fullText);
+            sections = parseSectionsWithPage(pageContents);
 
             if (sections.isEmpty()) {
-                sections.add(new DocumentSection("全文内容", fullText, 1));
+                String fullText = String.join("\n\n", pageContents.values());
+                sections.add(new DocumentSection("全文内容", fullText, 1, "全文内容", 1));
             }
 
             document.close();
@@ -138,43 +134,70 @@ public class PdfParserServiceImpl implements DocumentParserService {
         return false;
     }
 
-    private List<DocumentSection> parseSections(String text) {
+    /**
+     * 逐页扫描：为每个 section 记录起始 {@code pageNumber} 与 heading 面包屑。
+     */
+    private List<DocumentSection> parseSectionsWithPage(Map<Integer, String> pageContents) {
         List<DocumentSection> sections = new ArrayList<>();
-        String[] lines = text.split("\n");
 
         StringBuilder currentTitle = new StringBuilder();
         StringBuilder currentContent = new StringBuilder();
         int currentLevel = 1;
+        Integer currentPage = null;
+        String currentHeadingPath = null;
 
-        for (String line : lines) {
-            String trimmedLine = line.trim();
+        java.util.Deque<int[]> levelStack = new java.util.ArrayDeque<>();
+        java.util.Deque<String> titleStack = new java.util.ArrayDeque<>();
 
-            if (trimmedLine.isEmpty()) {
-                if (currentContent.length() > 0) {
-                    currentContent.append("\n");
-                }
-                continue;
-            }
+        for (Map.Entry<Integer, String> e : pageContents.entrySet()) {
+            int pageNumber = e.getKey();
+            String[] lines = e.getValue().split("\n");
 
-            Integer headingLevel = detectHeadingLevel(trimmedLine);
+            for (String line : lines) {
+                String trimmedLine = line.trim();
 
-            if (headingLevel != null) {
-                if (currentTitle.length() > 0) {
-                    sections.add(new DocumentSection(
-                            currentTitle.toString().trim(),
-                            currentContent.toString().trim(),
-                            currentLevel
-                    ));
+                if (trimmedLine.isEmpty()) {
+                    if (currentContent.length() > 0) {
+                        currentContent.append("\n");
+                    }
+                    continue;
                 }
 
-                currentTitle = new StringBuilder(trimmedLine);
-                currentContent = new StringBuilder();
-                currentLevel = headingLevel;
-            } else {
-                if (currentContent.length() > 0) {
-                    currentContent.append("\n");
+                Integer headingLevel = detectHeadingLevel(trimmedLine);
+
+                if (headingLevel != null) {
+                    if (currentTitle.length() > 0) {
+                        sections.add(new DocumentSection(
+                                currentTitle.toString().trim(),
+                                currentContent.toString().trim(),
+                                currentLevel,
+                                currentHeadingPath,
+                                currentPage
+                        ));
+                    }
+
+                    while (!levelStack.isEmpty() && levelStack.peek()[0] >= headingLevel) {
+                        levelStack.pop();
+                        titleStack.pop();
+                    }
+                    levelStack.push(new int[]{headingLevel});
+                    titleStack.push(trimmedLine);
+                    currentHeadingPath = buildHeadingPath(titleStack);
+
+                    currentTitle = new StringBuilder(trimmedLine);
+                    currentContent = new StringBuilder();
+                    currentLevel = headingLevel;
+                    currentPage = pageNumber;
+                } else {
+                    if (currentContent.length() > 0) {
+                        currentContent.append("\n");
+                    }
+                    currentContent.append(trimmedLine);
+                    // 尚未遇到任何 heading 的正文，页码取首次出现的页
+                    if (currentPage == null) {
+                        currentPage = pageNumber;
+                    }
                 }
-                currentContent.append(trimmedLine);
             }
         }
 
@@ -182,11 +205,30 @@ public class PdfParserServiceImpl implements DocumentParserService {
             sections.add(new DocumentSection(
                     currentTitle.toString().trim(),
                     currentContent.toString().trim(),
-                    currentLevel
+                    currentLevel,
+                    currentHeadingPath,
+                    currentPage
+            ));
+        } else if (currentContent.length() > 0) {
+            // 全文没有任何 heading 但有正文的情形
+            sections.add(new DocumentSection(
+                    "全文内容",
+                    currentContent.toString().trim(),
+                    1,
+                    "全文内容",
+                    currentPage == null ? 1 : currentPage
             ));
         }
 
         return sections;
+    }
+
+    /** 把 titleStack（栈顶为最新 heading）按栈底 → 栈顶顺序拼成 {@code "父 / 子 / 孙"} */
+    private String buildHeadingPath(java.util.Deque<String> titleStack) {
+        if (titleStack.isEmpty()) return null;
+        List<String> ordered = new ArrayList<>(titleStack);
+        java.util.Collections.reverse(ordered);
+        return String.join(" / ", ordered);
     }
 
     private Integer detectHeadingLevel(String line) {

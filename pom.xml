@@ -93,6 +93,16 @@
             <version>3.0.3</version>
         </dependency>
 
+        <!-- Flyway：数据库版本迁移，自动执行 db/migration/V*.sql -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
         <!-- Spring AI 相关模型, deepseek 和 zhipuai -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
@@ -148,6 +158,12 @@
         <dependency>
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-crypto</artifactId>
+        </dependency>
+
+        <!-- Redis -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
 
         <!-- PDF 解析 -->
