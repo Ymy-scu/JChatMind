@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -45,6 +46,8 @@ public class RagServiceImpl implements RagService {
     private final RagProperties ragProperties;
     private final RerankService rerankService;
     private final ExecutorService hybridExecutor;
+    private final String embeddingModel;
+    private final Duration embeddingTimeout;
 
     public RagServiceImpl(
             WebClient.Builder builder,
@@ -52,15 +55,25 @@ public class RagServiceImpl implements RagService {
             RagProperties ragProperties,
             RerankService rerankService,
             @Qualifier("hybridExecutor") ExecutorService hybridExecutor,
-            @Value("${embedding.url:http://localhost:11434}") String embeddingUrl,
-            @Value("${embedding.enabled:true}") boolean embeddingEnabled
+            @Value("${embedding.url:}") String legacyEmbeddingUrl,
+            @Value("${embedding.enabled:#{null}}") Boolean legacyEmbeddingEnabled
     ) {
-        this.webClient = builder.baseUrl(embeddingUrl).build();
         this.chunkBgeM3Mapper = chunkBgeM3Mapper;
         this.ragProperties = ragProperties;
         this.rerankService = rerankService;
         this.hybridExecutor = hybridExecutor;
-        this.embeddingEnabled = embeddingEnabled;
+
+        // 优先读 RagProperties.embedding.*，兼容旧的 embedding.url / embedding.enabled 顶级配置
+        RagProperties.Embedding cfg = ragProperties.getEmbedding();
+        String url = (legacyEmbeddingUrl != null && !legacyEmbeddingUrl.isBlank())
+                ? legacyEmbeddingUrl : cfg.getUrl();
+        this.embeddingEnabled = legacyEmbeddingEnabled != null ? legacyEmbeddingEnabled : cfg.isEnabled();
+        this.embeddingModel = cfg.getModel();
+        this.embeddingTimeout = Duration.ofMillis(Math.max(1000, cfg.getTimeoutMs()));
+
+        this.webClient = builder.baseUrl(url).build();
+        log.info("RagService 初始化: url={}, model={}, enabled={}, timeoutMs={}",
+                url, embeddingModel, embeddingEnabled, cfg.getTimeoutMs());
     }
 
     // ------------------------------------------------------------------
@@ -77,19 +90,62 @@ public class RagServiceImpl implements RagService {
         if (!embeddingEnabled) {
             throw new IllegalStateException("Embedding 服务未启用");
         }
+        if (text == null || text.isBlank()) {
+            throw new IllegalArgumentException("embed 入参不能为空");
+        }
         EmbeddingResponse resp = webClient.post()
                 .uri("/api/embeddings")
                 .bodyValue(Map.of(
-                        "model", "bge-m3",
+                        "model", embeddingModel,
                         "prompt", text
                 ))
                 .retrieve()
                 .bodyToMono(EmbeddingResponse.class)
+                .timeout(embeddingTimeout)
                 .block();
         if (resp == null || resp.getEmbedding() == null) {
             throw new IllegalStateException("Embedding 返回为空");
         }
         return resp.getEmbedding();
+    }
+
+    /**
+     * 并行批量 embedding：用于文档入库时的 chunk 批处理。
+     *
+     * <p>并发度由 {@code jchatmind.rag.embedding.concurrency} 控制（默认 3）；
+     * 单条超时受 {@code embedding.timeoutMs} 保护；某条失败会记录 WARN 但整批继续。</p>
+     *
+     * @return 与入参同长的数组；失败位置为 {@code null}
+     */
+    @Override
+    public float[][] embedBatch(List<String> texts) {
+        if (texts == null || texts.isEmpty()) return new float[0][];
+        int concurrency = Math.max(1, Math.min(texts.size(), ragProperties.getEmbedding().getConcurrency()));
+        float[][] out = new float[texts.size()][];
+
+        java.util.concurrent.Semaphore permit = new java.util.concurrent.Semaphore(concurrency);
+        List<CompletableFuture<Void>> futures = new ArrayList<>(texts.size());
+
+        for (int i = 0; i < texts.size(); i++) {
+            final int idx = i;
+            final String t = texts.get(i);
+            CompletableFuture<Void> f = CompletableFuture.runAsync(() -> {
+                try {
+                    permit.acquire();
+                    out[idx] = embed(t);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    log.warn("批量 embed 被打断: idx={}", idx);
+                } catch (Exception e) {
+                    log.warn("批量 embed 失败: idx={}, err={}", idx, e.getMessage());
+                } finally {
+                    permit.release();
+                }
+            }, hybridExecutor);
+            futures.add(f);
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        return out;
     }
 
     // ------------------------------------------------------------------
@@ -256,24 +312,40 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
-     * 归一化 bge-m3 向量的 cosine 距离与 L2 距离数学等价（都是 √2·(1-cos)），
-     * ORDER BY 只影响顺序，不影响绝对分数。为了做阈值过滤，此处只保留前 N 条
-     * "有内容"的结果——真正的 cosine 阈值判定放在 rerank 前的语义打分中做
-     * （rerank 关闭时靠向量顺序天然保序）。
+     * 用 {@code chunk.score}（SQL 返回的 cosine distance ∈ [0, 2]）过滤。
+     * {@code similarity = 1 - distance}；threshold 越大越严。
      *
-     * <p>注：pgvector 目前不方便一次 SQL 返回 distance；后续可用生成列或
-     * {@code SELECT ..., embedding &lt;=&gt; :q AS distance FROM ...} 精确过滤。</p>
+     * <p>兼容：若 score 为 null（旧调用路径 / mock），保守不砍。</p>
      */
     private List<ChunkBgeM3> filterByCosineThreshold(List<ChunkBgeM3> hits, double threshold) {
-        // 当前保守做法：不砍。真正阈值语义等后续变更引入 distance 列后再收紧。
-        // 保留 hook 以便日志/后续替换。
-        log.debug("向量召回命中 {} 条，cosine 阈值 {}", hits.size(), threshold);
-        return hits;
+        if (hits.isEmpty() || threshold <= 0.0) return hits;
+        List<ChunkBgeM3> kept = new ArrayList<>(hits.size());
+        int dropped = 0;
+        for (ChunkBgeM3 c : hits) {
+            Double dist = c.getScore();
+            if (dist == null) {
+                kept.add(c);
+                continue;
+            }
+            double sim = 1.0 - dist;
+            if (sim >= threshold) {
+                kept.add(c);
+            } else {
+                dropped++;
+            }
+        }
+        if (dropped > 0) {
+            log.debug("cosine 阈值过滤: 输入={}, 保留={}, 丢弃={}, threshold={}",
+                    hits.size(), kept.size(), dropped, threshold);
+        }
+        return kept;
     }
 
     private List<RetrievedChunk> toRetrieved(List<ChunkBgeM3> chunks) {
         List<RetrievedChunk> out = new ArrayList<>(chunks.size());
         for (ChunkBgeM3 c : chunks) {
+            // 有 distance 就换算成相似度，方便下游展示；BM25 路径 score 为 null → 0.0
+            double sim = c.getScore() == null ? 0.0 : Math.max(0.0, 1.0 - c.getScore());
             out.add(RetrievedChunk.builder()
                     .id(c.getId())
                     .documentId(c.getDocId())
@@ -282,7 +354,7 @@ public class RagServiceImpl implements RagService {
                     .headingPath(c.getHeadingPath())
                     .chunkIndex(c.getChunkIndex())
                     .content(c.getContent())
-                    .score(0.0)
+                    .score(sim)
                     .build());
         }
         return out;

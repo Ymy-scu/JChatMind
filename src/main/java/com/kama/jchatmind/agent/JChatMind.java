@@ -130,6 +130,15 @@ public class JChatMind {
     private List<RetrievedChunk> currentReferences = new ArrayList<>();
 
     /**
+     * 上一次 {@link #ensureKnowledgeContext()} 触发时的用户 query，
+     * 用来在 ReAct 循环内多次 think 时短路重复检索（用户没换问题就不重新召回）。
+     */
+    private String lastRetrievalQuery;
+
+    /** 单个 chunk 拼进 SystemMessage 前的正文截断上限，避免超长文档挤爆上下文窗口。 */
+    private static final int PROMPT_CHUNK_CONTENT_MAX_LEN = 800;
+
+    /**
      * 无参构造函数
      */
     public JChatMind() {
@@ -193,13 +202,13 @@ public class JChatMind {
                 .maxMessages(maxMessages == null ? DEFAULT_MAX_MESSAGES : maxMessages)
                 .build();
 
-        // 加载历史对话消息
+        // 加载历史业务消息（USER/ASSISTANT/TOOL）。
+        // 所有 SystemMessage 由 rebuildSystemContext 在此之后统一注入到位置 0，
+        // 保证 SystemMessage 只出现在消息序列开头，避免部分 LLM 把
+        // 尾部/中部的 SystemMessage 当作普通指令处理。
         this.chatMemory.add(chatSessionId, memory);
-
-        // 如果有系统提示词，将其作为系统消息添加到对话历史
-        if (StringUtils.hasLength(systemPrompt)) {
-            this.chatMemory.add(chatSessionId, new SystemMessage(systemPrompt));
-        }
+        // 首次组装：systemPrompt + 最新摘要（RAG 结果稍后 ensureKnowledgeContext 补进来）
+        rebuildSystemContext();
 
         // 配置聊天选项，禁用内部工具自动执行，改为手动控制
         this.chatOptions = DefaultToolCallingChatOptions.builder()
@@ -234,57 +243,122 @@ public class JChatMind {
      * </ul>
      */
     private void ensureKnowledgeContext() {
+        // 如果没有配置知识库或 RAG 服务，直接返回
+        if (availableKbs == null || availableKbs.isEmpty() || ragService == null) {
+            this.currentReferences = new ArrayList<>();
+            return;
+        }
+
+        // 提取用户最后一条消息作为当前查询
+        List<Message> messages = chatMemory.get(chatSessionId);
+        String currentQuery = extractLastUserMessage(messages);
+        if (!StringUtils.hasText(currentQuery)) {
+            this.currentReferences = new ArrayList<>();
+            return;
+        }
+
+        // ReAct 循环内 think() 会被多次调用，用户如果没换问题就没必要重召回
+        if (currentQuery.equals(this.lastRetrievalQuery) && !this.currentReferences.isEmpty()) {
+            log.debug("同 query 命中缓存，跳过重复 retrieve: {}", currentQuery);
+            return;
+        }
+
         // 每一轮都先重置引用列表，避免上一轮遗留
         this.currentReferences = new ArrayList<>();
 
-        // 如果没有配置知识库或 RAG 服务，直接返回
-        if (availableKbs == null || availableKbs.isEmpty() || ragService == null) {
-            return;
-        }
-
-        // 获取当前对话历史
-        List<Message> messages = chatMemory.get(chatSessionId);
-
-        // 提取用户最后一条消息作为当前查询
-        String currentQuery = extractLastUserMessage(messages);
-        if (!StringUtils.hasText(currentQuery)) {
-            return;
-        }
-
-        // 对所有可用知识库并行/串行调用 retrieve；按 (documentId, chunkIndex) 去重
+        // 多 KB 并行 retrieve；按 (documentId, chunkIndex) 去重
         LinkedHashMap<String, RetrievedChunk> deduped = new LinkedHashMap<>();
+        List<java.util.concurrent.CompletableFuture<List<RetrievedChunk>>> futures =
+                new ArrayList<>(availableKbs.size());
         for (KnowledgeBaseDTO kb : availableKbs) {
-            try {
-                List<RetrievedChunk> hits = ragService.retrieve(kb.getId(), currentQuery);
-                if (hits == null || hits.isEmpty()) {
-                    continue;
+            futures.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                try {
+                    return ragService.retrieve(kb.getId(), currentQuery);
+                } catch (Exception e) {
+                    log.warn("Failed to retrieve knowledge from kb: {}", kb.getId(), e);
+                    return List.<RetrievedChunk>of();
                 }
-                for (RetrievedChunk c : hits) {
-                    String key = referenceKey(c);
-                    deduped.putIfAbsent(key, c);
-                }
-                log.info("Retrieved {} chunks from kb: {}", hits.size(), kb.getId());
-            } catch (Exception e) {
-                log.warn("Failed to retrieve knowledge from kb: {}", kb.getId(), e);
+            }));
+        }
+        for (int i = 0; i < futures.size(); i++) {
+            String kbId = availableKbs.get(i).getId();
+            List<RetrievedChunk> hits = futures.get(i).join();
+            if (hits == null || hits.isEmpty()) continue;
+            for (RetrievedChunk c : hits) {
+                deduped.putIfAbsent(referenceKey(c), c);
             }
+            log.info("Retrieved {} chunks from kb: {}", hits.size(), kbId);
         }
 
         if (deduped.isEmpty()) {
+            this.lastRetrievalQuery = currentQuery;
             return;
         }
 
         // 缓存本轮引用元数据
         this.currentReferences = new ArrayList<>(deduped.values());
+        this.lastRetrievalQuery = currentQuery;
 
-        // 只拼一条 SystemMessage，避免 chatMemory 累积
-        String resultContent = this.currentReferences.stream()
-                .map(this::formatChunkForPrompt)
-                .collect(Collectors.joining("\n\n"));
-        String knowledgeContext = "【知识库检索结果】\n" + resultContent;
-        chatMemory.add(chatSessionId, new SystemMessage(knowledgeContext));
+        // 让统一的系统上下文注入负责拼接 systemPrompt + 摘要 + 检索结果，
+        // 保证 SystemMessage 始终位于消息序列位置 0。
+        rebuildSystemContext();
 
         log.info("Pre-retrieved {} unique chunks for query: {}",
                 this.currentReferences.size(), currentQuery);
+    }
+
+    /**
+     * 重建"系统上下文块"并放到 chatMemory 位置 0。
+     *
+     * <p>组成（按顺序拼接，缺失部分自动省略）：</p>
+     * <ol>
+     *   <li>{@code systemPrompt}：Agent 的角色/行为定义</li>
+     *   <li>{@code 【历史对话摘要】}：{@link ChatMemoryCompressionService#getLatestSummary}</li>
+     *   <li>{@code 【知识库检索结果】}：{@link #currentReferences}</li>
+     * </ol>
+     *
+     * <p>核心不变式：</p>
+     * <ul>
+     *   <li>chatMemory 里的 SystemMessage 数量始终 &lt;= 1，且只可能在位置 0</li>
+     *   <li>不修改 USER/ASSISTANT/TOOL 消息的相对顺序，
+     *       避免打断 tool_calls ↔ tool_response 相邻性（Deepseek/GLM 会 400）</li>
+     * </ul>
+     */
+    private void rebuildSystemContext() {
+        StringBuilder sb = new StringBuilder();
+
+        if (StringUtils.hasLength(systemPrompt)) {
+            sb.append(systemPrompt);
+        }
+
+        try {
+            String summary = chatMemoryCompressionService == null
+                    ? null
+                    : chatMemoryCompressionService.getLatestSummary(chatSessionId);
+            if (StringUtils.hasText(summary)) {
+                if (sb.length() > 0) sb.append("\n\n");
+                sb.append("【历史对话摘要】\n").append(summary);
+            }
+        } catch (Exception e) {
+            log.warn("Load compression summary failed: {}", e.getMessage());
+        }
+
+        if (currentReferences != null && !currentReferences.isEmpty()) {
+            if (sb.length() > 0) sb.append("\n\n");
+            String refText = currentReferences.stream()
+                    .map(this::formatChunkForPrompt)
+                    .collect(Collectors.joining("\n\n"));
+            sb.append("【知识库检索结果】\n").append(refText);
+        }
+
+        // 剔除现有全部 SystemMessage，然后在位置 0 插入合并后的
+        List<Message> current = new ArrayList<>(chatMemory.get(chatSessionId));
+        current.removeIf(m -> m instanceof SystemMessage);
+        if (sb.length() > 0) {
+            current.add(0, new SystemMessage(sb.toString()));
+        }
+        chatMemory.clear(chatSessionId);
+        chatMemory.add(chatSessionId, current);
     }
 
     /**
@@ -304,8 +378,13 @@ public class JChatMind {
             if (StringUtils.hasText(heading)) sb.append(" · ").append(heading);
             sb.append("]\n");
         }
-        if (c.getContent() != null) {
-            sb.append(c.getContent());
+        String content = c.getContent();
+        if (content != null) {
+            if (content.length() > PROMPT_CHUNK_CONTENT_MAX_LEN) {
+                sb.append(content, 0, PROMPT_CHUNK_CONTENT_MAX_LEN).append("……");
+            } else {
+                sb.append(content);
+            }
         }
         return sb.toString();
     }
@@ -403,24 +482,19 @@ public class JChatMind {
     }
 
     /**
-     * 检查并执行对话历史压缩
+     * 检查并执行对话历史压缩。
      *
      * <p>压缩策略：每 5 轮对话（10条消息）触发一次压缩，将长对话历史
      * 压缩为摘要，减少上下文长度，提升性能。</p>
+     *
+     * <p>压缩通过 {@link ChatMemoryCompressionService#compressAsync} 异步执行，
+     * 用户可感知的 SSE 流式响应不会被 LLM 生成摘要（3-8 秒）阻塞。
+     * 异步失败仅记日志，不影响主流程；下一轮消息会再次触发检查。</p>
      */
     private void checkAndCompress() {
-        // 判断是否达到压缩条件
         if (chatMemoryCompressionService.shouldCompress(this.chatSessionId)) {
-            log.info("Triggering compression for session: {}", this.chatSessionId);
-            try {
-                // 执行压缩，生成对话摘要
-                String summary = chatMemoryCompressionService.compress(this.chatSessionId, this.chatClient);
-                if (summary != null) {
-                    log.info("Compression completed for session: {}", this.chatSessionId);
-                }
-            } catch (Exception e) {
-                log.error("Compression failed for session: {}", this.chatSessionId, e);
-            }
+            log.info("Triggering async compression for session: {}", this.chatSessionId);
+            chatMemoryCompressionService.compressAsync(this.chatSessionId, this.chatClient);
         }
     }
 

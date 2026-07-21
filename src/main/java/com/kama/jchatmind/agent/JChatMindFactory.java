@@ -174,25 +174,23 @@ public class JChatMindFactory {
             }
         }
 
-        // 存储转换后的 Spring AI Message 对象
+        // 存储转换后的 Spring AI Message 对象。
+        //
+        // 注意：此处只恢复业务消息（USER / ASSISTANT / TOOL）。
+        // 所有 SystemMessage（agent systemPrompt + 压缩摘要 + RAG 检索结果）
+        // 统一由 JChatMind.rebuildSystemContext 合并为一条 SystemMessage 放位置 0；
+        // 避免这里加一条摘要、构造函数末尾再追加 systemPrompt、
+        // 检索时又 append 一条 —— 后两者会让 SystemMessage 出现在消息尾部/中间，
+        // 被大部分 LLM 当作普通指令穿插处理，语义不稳定。
         List<Message> memory = new ArrayList<>();
 
-        // 4. 加载压缩摘要作为上下文
-        String summary = chatMemoryCompressionService.getLatestSummary(chatSessionId);
-        if (summary != null && !summary.isEmpty()) {
-            memory.add(new SystemMessage("【历史对话摘要】\n" + summary));
-            log.info("Loaded compression summary for session: {}", chatSessionId);
-        }
-
-        // 5. 遍历每条消息，根据角色类型进行转换
+        // 遍历每条消息，根据角色类型进行转换（跳过 SYSTEM，由 JChatMind 统一重建）
         for (ChatMessageDTO chatMessageDTO : chatMessages) {
             switch (chatMessageDTO.getRole()) {
                 case SYSTEM:
-                    // 系统提示词，跳过空内容
-                    if (!StringUtils.hasLength(chatMessageDTO.getContent())) continue;
-                    // SystemMessage 必须放在最前面，所以插入到索引 0
-                    memory.add(0, new SystemMessage(chatMessageDTO.getContent()));
-                    break;
+                    // 历史里的 SystemMessage 交给 JChatMind.rebuildSystemContext 处理，
+                    // 这里跳过，避免顺序错乱。
+                    continue;
 
                 case USER:
                     // 用户消息，跳过空内容

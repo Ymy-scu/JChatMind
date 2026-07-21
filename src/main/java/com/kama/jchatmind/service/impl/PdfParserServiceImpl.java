@@ -53,9 +53,12 @@ public class PdfParserServiceImpl implements DocumentParserService {
 
             sections = parseSectionsWithPage(pageContents);
 
-            if (sections.isEmpty()) {
-                String fullText = String.join("\n\n", pageContents.values());
-                sections.add(new DocumentSection("全文内容", fullText, 1, "全文内容", 1));
+            // 兜底：全篇没有识别到任何 heading，或只识别到一个"全文内容"包裹时，
+            // 按段落（连续空行）二次切分，避免把整份文档塞成一个 section。
+            // 典型场景：简历、说明书、无编号标题的短文档。
+            if (sections.isEmpty()
+                    || (sections.size() == 1 && "全文内容".equals(sections.get(0).getTitle()))) {
+                sections = fallbackSplitByParagraph(pageContents);
             }
 
             document.close();
@@ -221,6 +224,78 @@ public class PdfParserServiceImpl implements DocumentParserService {
         }
 
         return sections;
+    }
+
+    /**
+     * 兜底切分：按段落（连续空行）+ 段落 token 上限拆分。
+     *
+     * <p>用于简历/说明书这种无编号标题的短文档：</p>
+     * <ul>
+     *   <li>先按 "\n\n+"（连续空行）拆段落，天然对应 Word/PDF 的视觉段落</li>
+     *   <li>过短段落（&lt; minChars=20）与相邻段合并，避免只有"姓名: 张三"这种碎片</li>
+     *   <li>过长段落（&gt; softMaxChars=1200）就地拆分，交给 TokenAwareSplitter 二次切</li>
+     *   <li>heading 使用段落首行作为提示（截断到 30 字符），页码取该段所在页</li>
+     * </ul>
+     */
+    private List<DocumentSection> fallbackSplitByParagraph(Map<Integer, String> pageContents) {
+        final int minChars = 20;
+        final int softMaxChars = 1200;
+
+        List<DocumentSection> sections = new ArrayList<>();
+        StringBuilder buf = new StringBuilder();
+        Integer bufPage = null;
+
+        for (Map.Entry<Integer, String> e : pageContents.entrySet()) {
+            int page = e.getKey();
+            String[] paragraphs = e.getValue().split("\\r?\\n\\s*\\r?\\n+");
+
+            for (String raw : paragraphs) {
+                String p = raw.strip();
+                if (p.isEmpty()) continue;
+
+                if (buf.length() > 0 && buf.length() + p.length() > softMaxChars) {
+                    sections.add(toParagraphSection(buf.toString(), bufPage));
+                    buf.setLength(0);
+                    bufPage = null;
+                }
+
+                if (bufPage == null) bufPage = page;
+                if (buf.length() > 0) buf.append("\n\n");
+                buf.append(p);
+
+                // 超过软上限，直接 flush；避免继续累积
+                if (buf.length() >= softMaxChars) {
+                    sections.add(toParagraphSection(buf.toString(), bufPage));
+                    buf.setLength(0);
+                    bufPage = null;
+                    continue;
+                }
+
+                // 累积到 minChars 之上 才允许作为独立段 flush（下一次循环判定合并）
+                if (buf.length() >= minChars) {
+                    // 保留在 buf 中，等下一段判断是否需要合并（下一段进来时若不超软上限就会拼进来）
+                }
+            }
+        }
+        if (buf.length() > 0) {
+            sections.add(toParagraphSection(buf.toString(), bufPage == null ? 1 : bufPage));
+        }
+        // 极端场景：整份文档都是空白
+        if (sections.isEmpty()) {
+            String full = String.join("\n\n", pageContents.values()).strip();
+            if (!full.isEmpty()) {
+                sections.add(new DocumentSection("全文内容", full, 1, "全文内容", 1));
+            }
+        }
+        return sections;
+    }
+
+    /** 用段落首行（截断到 30 字符）作为伪 heading，便于后续引用溯源。 */
+    private DocumentSection toParagraphSection(String content, Integer page) {
+        String firstLine = content.split("\\r?\\n", 2)[0].strip();
+        String title = firstLine.length() > 30 ? firstLine.substring(0, 30) + "…" : firstLine;
+        if (title.isEmpty()) title = "段落";
+        return new DocumentSection(title, content, 1, title, page == null ? 1 : page);
     }
 
     /** 把 titleStack（栈顶为最新 heading）按栈底 → 栈顶顺序拼成 {@code "父 / 子 / 孙"} */

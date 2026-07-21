@@ -1,5 +1,6 @@
 package com.kama.jchatmind.service.impl;
 
+import com.kama.jchatmind.mapper.ChatMessageMapper;
 import com.kama.jchatmind.mapper.ChatMessageSummaryMapper;
 import com.kama.jchatmind.model.dto.ChatMessageDTO;
 import com.kama.jchatmind.model.entity.ChatMessageSummary;
@@ -8,13 +9,10 @@ import com.kama.jchatmind.service.RedisChatMemoryService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.messages.AssistantMessage;
-import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.ToolResponseMessage;
-import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -36,15 +34,25 @@ public class ChatMemoryCompressionServiceImpl implements ChatMemoryCompressionSe
      */
     private static final int KEEP_RECENT_MESSAGES = 10;
 
+    /**
+     * 单次压缩输入的字符上限（近似 token 上限）。
+     * 超过时从尾部保留 —— 因为尾部对当前对话更相关，头部信息已经在
+     * 上一轮的历史摘要里覆盖了。
+     */
+    private static final int MAX_COMPRESSION_CHARS = 20_000;
+
     private final RedisChatMemoryService redisChatMemoryService;
     private final ChatMessageSummaryMapper chatMessageSummaryMapper;
+    private final ChatMessageMapper chatMessageMapper;
 
     public ChatMemoryCompressionServiceImpl(
             RedisChatMemoryService redisChatMemoryService,
-            ChatMessageSummaryMapper chatMessageSummaryMapper
+            ChatMessageSummaryMapper chatMessageSummaryMapper,
+            ChatMessageMapper chatMessageMapper
     ) {
         this.redisChatMemoryService = redisChatMemoryService;
         this.chatMessageSummaryMapper = chatMessageSummaryMapper;
+        this.chatMessageMapper = chatMessageMapper;
     }
 
     @Override
@@ -100,10 +108,39 @@ public class ChatMemoryCompressionServiceImpl implements ChatMemoryCompressionSe
         // 6. 清空 Redis 并重新加载保留的消息
         redisChatMemoryService.clearSession(sessionId);
         redisChatMemoryService.addMessages(sessionId, messagesToKeep);
+
+        // 7. 同步清理 DB 中已压缩的老消息，避免下次 loadMemory 走 DB 分支时
+        //    把老消息与摘要一起拉回上下文，形成重复放大。
+        try {
+            int deleted = chatMessageMapper.deleteOldestExcludingRecent(sessionId, KEEP_RECENT_MESSAGES);
+            log.info("Purged {} compressed messages from DB for session: {}", deleted, sessionId);
+        } catch (Exception e) {
+            // 即便 DB 清理失败，摘要仍然是有效的；下次 loadMemory 会取到近期消息 + 摘要。
+            // 但会存在少量老消息重复参与上下文，等待下次压缩再收敛。
+            log.warn("Failed to purge compressed messages from DB for session: {}", sessionId, e);
+        }
+
         log.info("Compressed session: {}, removed {} messages, kept {} messages",
                 sessionId, messagesToCompress.size(), messagesToKeep.size());
 
         return summary;
+    }
+
+    /**
+     * 异步压缩入口。调用方（{@link com.kama.jchatmind.agent.JChatMind}）
+     * 只需 fire-and-forget，压缩耗时（3-8s LLM 调用）不阻塞 SSE 流式输出。
+     *
+     * <p>使用默认 {@code taskExecutor}（{@link com.kama.jchatmind.config.AsyncConfig}
+     * 定义的 4-10 核心线程池）。</p>
+     */
+    @Async
+    @Override
+    public void compressAsync(String sessionId, ChatClient chatClient) {
+        try {
+            compress(sessionId, chatClient);
+        } catch (Exception e) {
+            log.error("Async compression failed for session: {}", sessionId, e);
+        }
     }
 
     @Override
@@ -161,9 +198,21 @@ public class ChatMemoryCompressionServiceImpl implements ChatMemoryCompressionSe
     }
 
     /**
-     * 构建压缩提示词
+     * 构建压缩提示词。
+     *
+     * <p>若 {@code conversationText} 超过 {@link #MAX_COMPRESSION_CHARS} 字符，
+     * 保留尾部 —— 因为尾部对当前对话更相关，头部信息会在上一轮的历史摘要中体现，
+     * 且避免撞 LLM context 上限 400。</p>
      */
     private String buildCompressionPrompt(String conversationText) {
+        String text = conversationText;
+        if (text != null && text.length() > MAX_COMPRESSION_CHARS) {
+            int truncated = text.length() - MAX_COMPRESSION_CHARS;
+            text = "……（此处省略较早的 " + truncated + " 字符）……\n"
+                    + text.substring(text.length() - MAX_COMPRESSION_CHARS);
+            log.info("Compression input truncated: kept last {} chars, dropped {} chars",
+                    MAX_COMPRESSION_CHARS, truncated);
+        }
         return """
                 请将以下对话历史压缩成简洁的摘要。要求：
                 1. 保留关键信息和上下文
@@ -176,6 +225,6 @@ public class ChatMemoryCompressionServiceImpl implements ChatMemoryCompressionSe
                 %s
 
                 请生成压缩摘要：
-                """.formatted(conversationText);
+                """.formatted(text);
     }
 }

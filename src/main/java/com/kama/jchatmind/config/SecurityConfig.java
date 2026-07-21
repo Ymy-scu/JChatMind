@@ -27,6 +27,11 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        // 认证策略（配合 JwtAuthenticationFilter 写入 SecurityContext）：
+        //   /api/auth/login|register       → permitAll
+        //   /api/auth/**                    → 必须携带有效 JWT
+        //   其它                            → 暂放行，等前端接入 token 后再改成 authenticated()
+        // 说明：filter 在 STATELESS 模式下每请求结束清 SecurityContext，避免线程池泄漏。
         http
                 .csrf(AbstractHttpConfigurer::disable)
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))

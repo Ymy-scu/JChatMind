@@ -20,6 +20,19 @@ public interface RagService {
     float[] embed(String text);
 
     /**
+     * 并行批量 embedding：并发度由 {@code jchatmind.rag.embedding.concurrency} 控制。
+     * 与入参一一对应；失败位置为 {@code null}，不抛出。
+     */
+    default float[][] embedBatch(List<String> texts) {
+        if (texts == null || texts.isEmpty()) return new float[0][];
+        float[][] out = new float[texts.size()][];
+        for (int i = 0; i < texts.size(); i++) {
+            try { out[i] = embed(texts.get(i)); } catch (Exception ignored) {}
+        }
+        return out;
+    }
+
+    /**
      * 兼容旧签名：单查询检索，返回命中 chunk 的正文列表。
      */
     List<String> similaritySearch(String kbId, String query);

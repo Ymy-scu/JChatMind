@@ -13,6 +13,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "jchatmind.rag")
 public class RagProperties {
 
+    /** Embedding 服务参数 */
+    private Embedding embedding = new Embedding();
+
     /** 切分策略参数 */
     private Chunk chunk = new Chunk();
 
@@ -28,8 +31,28 @@ public class RagProperties {
     /** 读取模式（new / legacy / both），支持灰度迁移 */
     private Read read = new Read();
 
+    /** 上传相关（后缀白名单等） */
+    private Upload upload = new Upload();
+
     /** 兼容旧行为的开关（迁移完成后应删除） */
     private boolean legacyMode = false;
+
+    @Data
+    public static class Embedding {
+        /** Embedding 服务 base URL；本地 Ollama 默认 http://localhost:11434 */
+        private String url = "http://localhost:11434";
+        /** Embedding 模型名 */
+        private String model = "bge-m3";
+        /** 单次 embed 请求超时（毫秒），避免 Ollama 挂时全链路阻塞 */
+        private int timeoutMs = 8000;
+        /** 是否启用 embedding（关闭后 embed() 抛异常，测试/降级场景使用） */
+        private boolean enabled = true;
+        /**
+         * 文档入库时并行 embedding 的并发度。
+         * 本地 Ollama 单机 2-4 已经够用，过高会打爆 GPU 显存或队列。
+         */
+        private int concurrency = 3;
+    }
 
     @Data
     public static class Chunk {
@@ -89,5 +112,16 @@ public class RagProperties {
     public static class Read {
         /** 读模式：new = 仅新路径，legacy = 仅旧路径，both = 迁移期同时读 */
         private String mode = "both";
+    }
+
+    @Data
+    public static class Upload {
+        /**
+         * 允许上传的文件后缀白名单（不带点，大小写不敏感）。
+         * 默认覆盖 PDF/Word/Markdown/纯文本；yaml 中可用逗号分隔覆盖。
+         */
+        private java.util.List<String> allowedExtensions = java.util.List.of(
+                "pdf", "docx", "doc", "md", "txt", "markdown"
+        );
     }
 }

@@ -11,6 +11,11 @@ spring:
   mvc:
     async:
       request-timeout: 1800000
+  # 文件上传上限（覆盖 Spring 默认 1MB / 10MB），并给 RAG 大文档留够余量。
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 60MB
   datasource:
     url: jdbc:postgresql://localhost:5432/jchatmind
     username: PC
@@ -79,6 +84,13 @@ document:
 # =============================================================================
 jchatmind:
   rag:
+    # Embedding 服务：本地 Ollama bge-m3，超时保护避免全链路阻塞
+    embedding:
+      url: http://localhost:11434
+      model: bge-m3
+      timeout-ms: 8000        # 单次 embed 请求超时（毫秒）
+      enabled: true
+      concurrency: 3          # 文档入库批量 embed 并发度
     # 切分策略：结构化解析结果之上，按 token 二次切分
     chunk:
       max-tokens: 512        # 单 chunk 最大 token 数
@@ -101,8 +113,11 @@ jchatmind:
       timeout-ms: 5000
       top-k: 5
     read:
-      mode: both             # new / legacy / both（迁移期建议 both）
+      mode: new               # new / legacy / both；灰度稳定后切回 new，避免双读浪费资源
     legacy-mode: false        # 兼容旧标题嵌入行为（不建议开启）
+    # 上传文件后缀白名单（大小写不敏感）；命中之外的后缀会被 DocumentController 拒绝
+    upload:
+      allowed-extensions: pdf,docx,doc,md,txt,markdown
 
 # 日志配置
 logging:

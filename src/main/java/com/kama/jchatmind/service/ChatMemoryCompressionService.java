@@ -33,6 +33,18 @@ public interface ChatMemoryCompressionService {
     String compress(String sessionId, org.springframework.ai.chat.client.ChatClient chatClient);
 
     /**
+     * 异步执行压缩，供 fire-and-forget 场景使用。
+     *
+     * <p>与 {@link #compress(String, org.springframework.ai.chat.client.ChatClient)}
+     * 相同的语义，但通过 {@code @Async} 在独立线程池执行，
+     * 不阻塞调用方（例如 SSE 流式输出主线程）。</p>
+     *
+     * @param sessionId 会话 ID
+     * @param chatClient 用于生成摘要的 ChatClient
+     */
+    void compressAsync(String sessionId, org.springframework.ai.chat.client.ChatClient chatClient);
+
+    /**
      * 获取会话的所有压缩摘要
      *
      * @param sessionId 会话ID

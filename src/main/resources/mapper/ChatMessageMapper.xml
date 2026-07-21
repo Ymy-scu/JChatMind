@@ -106,6 +106,23 @@
         DELETE FROM chat_message WHERE id = CAST(#{id} AS uuid)
     </delete>
 
+    <!--
+        删除会话内除最近 keepRecent 条之外的所有消息。
+        通过 NOT IN 子查询定位需要保留的行 id 集合，其余删除。
+        keepRecent 建议 >= chat_memory_compression 的 KEEP_RECENT_MESSAGES，
+        避免删掉下次 loadMemory 需要的近期上下文。
+    -->
+    <delete id="deleteOldestExcludingRecent">
+        DELETE FROM chat_message
+        WHERE session_id = CAST(#{sessionId} AS uuid)
+          AND id NOT IN (
+            SELECT id FROM chat_message
+            WHERE session_id = CAST(#{sessionId} AS uuid)
+            ORDER BY created_at DESC
+            LIMIT #{keepRecent}
+        )
+    </delete>
+
     <update id="updateById" parameterType="com.kama.jchatmind.model.entity.ChatMessage">
         UPDATE chat_message
         <set>

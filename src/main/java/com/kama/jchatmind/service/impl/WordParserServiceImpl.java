@@ -121,10 +121,60 @@ public class WordParserServiceImpl implements DocumentParserService {
             ));
         }
 
+        // 兜底：整份 docx 没识别到 heading，改按段落切
+        if (sections.isEmpty()) {
+            sections = fallbackParagraphSplitDocx(document);
+        }
+
         document.close();
 
         log.info("Word (docx) 解析完成，共提取 {} 个章节", sections.size());
         return sections;
+    }
+
+    /**
+     * docx 无 heading 兜底：按段落聚合、软上限 1200 字符切段。
+     *
+     * <p>典型场景：简历、说明书、纯正文 docx。段落首行做伪 heading 便于引用溯源。</p>
+     */
+    private List<DocumentSection> fallbackParagraphSplitDocx(XWPFDocument document) {
+        final int softMaxChars = 1200;
+        List<DocumentSection> out = new ArrayList<>();
+        StringBuilder buf = new StringBuilder();
+
+        for (IBodyElement el : document.getBodyElements()) {
+            String text = null;
+            if (el instanceof XWPFParagraph p) {
+                text = p.getText();
+            } else if (el instanceof XWPFTable table) {
+                text = convertTableToMarkdown(table);
+            }
+            if (text == null) continue;
+            String t = text.strip();
+            if (t.isEmpty()) continue;
+
+            if (buf.length() > 0 && buf.length() + t.length() > softMaxChars) {
+                out.add(toFallbackSection(buf.toString()));
+                buf.setLength(0);
+            }
+            if (buf.length() > 0) buf.append("\n\n");
+            buf.append(t);
+            if (buf.length() >= softMaxChars) {
+                out.add(toFallbackSection(buf.toString()));
+                buf.setLength(0);
+            }
+        }
+        if (buf.length() > 0) {
+            out.add(toFallbackSection(buf.toString()));
+        }
+        return out;
+    }
+
+    private DocumentSection toFallbackSection(String content) {
+        String firstLine = content.split("\\r?\\n", 2)[0].strip();
+        String title = firstLine.length() > 30 ? firstLine.substring(0, 30) + "…" : firstLine;
+        if (title.isEmpty()) title = "段落";
+        return new DocumentSection(title, content, 1, title, null);
     }
 
     private List<DocumentSection> parseDoc(InputStream inputStream) throws IOException {

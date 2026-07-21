@@ -47,6 +47,13 @@ public class ChunkBgeM3 {
 
     private LocalDateTime updatedAt;
 
+    /**
+     * 查询期派生字段：{@code similaritySearch} 通过 {@code embedding <=> :q AS distance}
+     * 返回的余弦距离（{@code distance ∈ [0, 2]}），由 {@code SimilarityResultMap}
+     * 映射至此。持久化列中不存在此字段，equals/hashCode 不参与。
+     */
+    private Double score;
+
     @Override
     public boolean equals(Object that) {
         if (this == that) {

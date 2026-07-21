@@ -351,17 +351,38 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
             return;
         }
 
-        int inserted = 0;
+        // 3) 批量并行 embedding：先过滤空正文，用 embedBatch 一次并发跑完
+        List<Chunk> nonEmpty = new ArrayList<>(finalChunks.size());
         for (Chunk c : finalChunks) {
-            String content = c.getContent();
-            if (content == null || content.isBlank()) {
+            if (c.getContent() != null && !c.getContent().isBlank()) {
+                nonEmpty.add(c);
+            } else {
                 log.warn("跳过空正文 chunk: documentId={}, chunkIndex={}", documentId, c.getChunkIndex());
+            }
+        }
+        if (nonEmpty.isEmpty()) {
+            log.warn("过滤后无可入库 chunk: documentId={}", documentId);
+            return;
+        }
+
+        List<String> texts = nonEmpty.stream().map(Chunk::getContent).toList();
+        long embedStart = System.currentTimeMillis();
+        float[][] vectors = ragService.embedBatch(texts);
+        log.info("批量 embed 完成: documentId={}, chunks={}, 耗时={}ms",
+                documentId, nonEmpty.size(), System.currentTimeMillis() - embedStart);
+
+        // 4) 组装入库；单条失败不影响其他
+        int inserted = 0;
+        int failed = 0;
+        for (int i = 0; i < nonEmpty.size(); i++) {
+            Chunk c = nonEmpty.get(i);
+            float[] embedding = vectors[i];
+            if (embedding == null) {
+                failed++;
+                log.warn("chunk embedding 为空，跳过: documentId={}, chunkIndex={}", documentId, c.getChunkIndex());
                 continue;
             }
             try {
-                // 3) 对最终 content 做 embedding（关键修复）
-                float[] embedding = ragService.embed(content);
-
                 ChunkBgeM3DTO.MetaData metaData = new ChunkBgeM3DTO.MetaData();
                 metaData.setTitle(c.getHeadingPath());
                 metaData.setHeadingLevel(1);
@@ -371,7 +392,7 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
                 ChunkBgeM3 chunk = ChunkBgeM3.builder()
                         .kbId(kbId)
                         .docId(documentId)
-                        .content(content)
+                        .content(c.getContent())
                         .metadata(metadataJson)
                         .embedding(embedding)
                         .filename(filename)
@@ -383,15 +404,15 @@ public class DocumentFacadeServiceImpl implements DocumentFacadeService {
                         .updatedAt(now)
                         .build();
 
-                int result = chunkBgeM3Mapper.insert(chunk);
-                if (result > 0) {
+                if (chunkBgeM3Mapper.insert(chunk) > 0) {
                     inserted++;
                 }
             } catch (Exception e) {
+                failed++;
                 log.error("创建 chunk 失败: documentId={}, chunkIndex={}", documentId, c.getChunkIndex(), e);
             }
         }
-        log.info("文档入库完成: documentId={}, 共生成 {} 个 chunk", documentId, inserted);
+        log.info("文档入库完成: documentId={}, 共生成 {} 个 chunk, 失败 {} 个", documentId, inserted, failed);
     }
 
     /**
